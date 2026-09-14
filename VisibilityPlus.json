@@ -5,7 +5,7 @@
   "Punchline": "Zone-filtered hiding for NPCs, minions, pets and chocobos.",
   "InternalName": "VisibilityPlus",
   "AssemblyVersion": "0.1.0.15",
-  "RepoUrl": "",
+  "RepoUrl": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus",
   "ApplicableVersion": "any",
   "Tags": [ "Hide", "Visibility", "NPC", "Minion", "Pet", "Chocobo" ],
   "DalamudApiLevel": 15,
