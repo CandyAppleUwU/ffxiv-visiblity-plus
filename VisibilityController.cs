@@ -38,8 +38,10 @@ public sealed class VisibilityController : IDisposable
     private readonly List<SyncSource> syncSources = [];
     private HashSet<nint> syncedAddrs = [];
     private long lastSyncPoll;
-    private const long SyncPollIntervalMs = 2_000;
+    private bool wasFilterActive;
+    private const long SyncPollIntervalMs = 1_000;
     private const long SyncStaleAfterMs = 10_000;
+    private const long SyncBackoffMs = 15_000;
 
     private sealed class SyncSource
     {
@@ -47,6 +49,8 @@ public sealed class VisibilityController : IDisposable
         public ICallGateSubscriber<List<nint>> Subscriber = null!;
         public int LastCount;
         public long LastOkAt;
+        public int FailCount;
+        public long NextRetryAt;
     }
 
     // Immutable snapshot so Framework.Update never enumerates a list the UI thread may mutate.
@@ -132,9 +136,17 @@ public sealed class VisibilityController : IDisposable
             if (!this.config.Enabled || !this.zoneSnapshot.Contains(territory))
             {
                 this.ResetHotkeyState();
+                this.wasFilterActive = false;
                 if (this.hidden.Count > 0)
                     this.ShowAll();
                 return;
+            }
+
+            if (!this.wasFilterActive)
+            {
+                // Freshly entered: poll sync state on this very frame.
+                this.wasFilterActive = true;
+                this.lastSyncPoll = 0;
             }
 
             var manager = GameObjectManager.Instance();
@@ -439,6 +451,8 @@ public sealed class VisibilityController : IDisposable
         bool anyOk = false;
         foreach (var source in this.syncSources)
         {
+            if (now < source.NextRetryAt)
+                continue; // backing off a failing provider so it can't drag the poll
             try
             {
                 var addrs = source.Subscriber.InvokeFunc();
@@ -447,11 +461,15 @@ public sealed class VisibilityController : IDisposable
                 union.UnionWith(addrs);
                 source.LastCount = addrs.Count;
                 source.LastOkAt = now;
+                source.FailCount = 0;
+                source.NextRetryAt = 0;
                 anyOk = true;
             }
             catch
             {
                 // Provider missing (not installed/loading) or call failed.
+                source.FailCount++;
+                source.NextRetryAt = now + (source.FailCount > 3 ? SyncBackoffMs : SyncPollIntervalMs);
             }
         }
         if (anyOk)

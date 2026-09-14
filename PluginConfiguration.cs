@@ -66,7 +66,7 @@ public class PluginConfiguration : IPluginConfiguration
     public List<uint> ZoneIds { get; set; } = [];
 
     /// <summary>Provenance stamp so shared configs can be traced to a build.</summary>
-    public string BuildTag = "0.1.0.16";
+    public string BuildTag = "0.1.0.17";
 
     public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }
