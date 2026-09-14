@@ -3,7 +3,7 @@
     <AssemblyVersion>0.1.0.15</AssemblyVersion>
     <FileVersion>$(AssemblyVersion)</FileVersion>
     <Version>$(AssemblyVersion)</Version>
-    <Authors>FSOS</Authors>
+    <Authors>CandyApple</Authors>
     <Product>Visibility Plus</Product>
     <Description>Hide NPCs, minions, pets and chocobos, restricted to selected zones.</Description>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
