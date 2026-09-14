@@ -107,6 +107,40 @@ public static class HideGroupsUI
             apply(f, p, c);
     }
 
+    private static void DrawKeepsWithSelf(int cogId, string popupId, IHideSettings s, PluginConfiguration cfg,
+        bool keepF, bool keepP, bool keepC,
+        System.Action<bool, bool, bool> applyKeep,
+        System.Func<bool> getSelf, System.Action<bool> setSelf)
+    {
+        bool f = keepF, p = keepP, c = keepC;
+        bool self = getSelf();
+        bool changed = false;
+        if (ImGuiComponents.IconButton(cogId, FontAwesomeIcon.Cog))
+            ImGui.OpenPopup(popupId);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Keep friends, party or FC members.\nHide Self below.");
+        if (ImGui.BeginPopup(popupId))
+        {
+            ImGui.Text("Keep:");
+            if (ImGui.Checkbox("Friends", ref f)) { cfg.Save(); changed = true; }
+            if (ImGui.Checkbox("Party Members", ref p)) { cfg.Save(); changed = true; }
+            if (ImGui.Checkbox("FC Members", ref c)) { cfg.Save(); changed = true; }
+            ImGui.Separator();
+            ImGui.Text("Hide:");
+            if (ImGui.Checkbox("Self", ref self))
+            {
+                setSelf(self);
+                changed = true;
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("When enabled, your own will also be hidden.");
+            ImGui.EndPopup();
+        }
+        ImGui.SameLine();
+        if (changed)
+            applyKeep(f, p, c);
+    }
+
     /// <param name="hold">Null in per-zone windows (hotkeys stay global).</param>
     /// <param name="ctl">Null in per-zone windows (no sync status there).</param>
     public static void DrawGroups(IHideSettings s, PluginConfiguration cfg, VisibilityController? ctl, HoldCaptureState? hold, string idSuffix)
@@ -180,9 +214,10 @@ public static class HideGroupsUI
         if (hold != null)
             DrawHoldKeybind("enemies" + idSuffix, ref cfg.HoldKeyEnemies, ref cfg.HoldCtrlEnemies, ref cfg.HoldShiftEnemies, ref cfg.HoldAltEnemies, hold, cfg);
 
-        DrawKeeps(1, "keepminions" + idSuffix, s, cfg,
+        DrawKeepsWithSelf(1, "keepminions" + idSuffix, s, cfg,
             s.KeepFriendMinions, s.KeepPartyMinions, s.KeepFcMinions,
-            (f, p, c) => { s.KeepFriendMinions = f; s.KeepPartyMinions = p; s.KeepFcMinions = c; });
+            (f, p, c) => { s.KeepFriendMinions = f; s.KeepPartyMinions = p; s.KeepFcMinions = c; },
+            () => s.HideOwnMinions, v => { s.HideOwnMinions = v; cfg.Save(); });
         bool hideMinions = s.HideMinions;
         if (ImGui.Checkbox("Minions", ref hideMinions))
         {
@@ -192,9 +227,10 @@ public static class HideGroupsUI
         if (hold != null)
             DrawHoldKeybind("minions" + idSuffix, ref cfg.HoldKeyMinions, ref cfg.HoldCtrlMinions, ref cfg.HoldShiftMinions, ref cfg.HoldAltMinions, hold, cfg);
 
-        DrawKeeps(2, "keeppets" + idSuffix, s, cfg,
+        DrawKeepsWithSelf(2, "keeppets" + idSuffix, s, cfg,
             s.KeepFriendPets, s.KeepPartyPets, s.KeepFcPets,
-            (f, p, c) => { s.KeepFriendPets = f; s.KeepPartyPets = p; s.KeepFcPets = c; });
+            (f, p, c) => { s.KeepFriendPets = f; s.KeepPartyPets = p; s.KeepFcPets = c; },
+            () => s.HideOwnPets, v => { s.HideOwnPets = v; cfg.Save(); });
         bool hidePets = s.HidePets;
         if (ImGui.Checkbox("Pets", ref hidePets))
         {
@@ -204,9 +240,10 @@ public static class HideGroupsUI
         if (hold != null)
             DrawHoldKeybind("pets" + idSuffix, ref cfg.HoldKeyPets, ref cfg.HoldCtrlPets, ref cfg.HoldShiftPets, ref cfg.HoldAltPets, hold, cfg);
 
-        DrawKeeps(3, "keepchocobos" + idSuffix, s, cfg,
+        DrawKeepsWithSelf(3, "keepchocobos" + idSuffix, s, cfg,
             s.KeepFriendChocobos, s.KeepPartyChocobos, s.KeepFcChocobos,
-            (f, p, c) => { s.KeepFriendChocobos = f; s.KeepPartyChocobos = p; s.KeepFcChocobos = c; });
+            (f, p, c) => { s.KeepFriendChocobos = f; s.KeepPartyChocobos = p; s.KeepFcChocobos = c; },
+            () => s.HideOwnChocobos, v => { s.HideOwnChocobos = v; cfg.Save(); });
         bool hideChocobos = s.HideChocobos;
         if (ImGui.Checkbox("Chocobos", ref hideChocobos))
         {
@@ -242,8 +279,11 @@ public static class HideGroupsUI
             DrawHoldKeybind("players" + idSuffix, ref cfg.HoldKeyPlayers, ref cfg.HoldCtrlPlayers, ref cfg.HoldShiftPlayers, ref cfg.HoldAltPlayers, hold, cfg);
 
         if (hold != null && ctl != null)
-            ImGui.TextDisabled(ctl.SyncStatus);
-
-        ImGui.TextDisabled("Your own minion, pet and chocobo are never hidden.");
+        {
+            string sync = ctl.SyncStatus;
+            // Shorten Snowcloak -> Snow, Lightless -> Light
+            sync = sync.Replace("Snowcloak", "Snow").Replace("Lightless", "Light");
+            ImGui.TextDisabled(sync);
+        }
     }
 }

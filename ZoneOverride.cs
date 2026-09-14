@@ -28,6 +28,9 @@ public class ZoneOverride : IHideSettings
     public bool KeepFcChocobos { get; set; }
     public bool KeepAggroEnemies { get; set; }
     public bool KeepQuestGivers { get; set; }
+    public bool HideOwnMinions { get; set; }
+    public bool HideOwnPets { get; set; }
+    public bool HideOwnChocobos { get; set; }
 
     public void CopyFrom(IHideSettings src)
     {
@@ -53,6 +56,9 @@ public class ZoneOverride : IHideSettings
         this.KeepFcChocobos = src.KeepFcChocobos;
         this.KeepAggroEnemies = src.KeepAggroEnemies;
         this.KeepQuestGivers = src.KeepQuestGivers;
+        this.HideOwnMinions = src.HideOwnMinions;
+        this.HideOwnPets = src.HideOwnPets;
+        this.HideOwnChocobos = src.HideOwnChocobos;
     }
 
     /// <summary>Snapshot of the current globals; the zone's starting defaults.</summary>

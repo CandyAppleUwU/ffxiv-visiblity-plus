@@ -16,5 +16,8 @@ public class Service
     [PluginService] public static IChatGui ChatGui { get; private set; } = null!;
     [PluginService] public static IGameGui GameGui { get; private set; } = null!;
     [PluginService] public static ITargetManager TargetManager { get; private set; } = null!;
+    [PluginService] public static IContextMenu ContextMenu { get; private set; } = null!;
     [PluginService] public static IPluginLog PluginLog { get; private set; } = null!;
+    [PluginService] public static ISigScanner SigScanner { get; private set; } = null!;
+    [PluginService] public static IGameInteropProvider GameInteropProvider { get; private set; } = null!;
 }

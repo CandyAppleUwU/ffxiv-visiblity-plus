@@ -1,6 +1,6 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <AssemblyVersion>0.1.0.18</AssemblyVersion>
+    <AssemblyVersion>0.1.0.19</AssemblyVersion>
     <FileVersion>$(AssemblyVersion)</FileVersion>
     <Version>$(AssemblyVersion)</Version>
     <Authors>CandyApple</Authors>
@@ -13,4 +13,10 @@
     <IsPackable>false</IsPackable>
     <SignAssembly>false</SignAssembly>
   </PropertyGroup>
+  <ItemGroup>
+    <Content Include="scream.wav">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
 </Project>

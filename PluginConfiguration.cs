@@ -9,6 +9,11 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
 
     public bool Enabled = true;
 
+    public int EnabledToggleKey;
+    public bool EnabledToggleCtrl;
+    public bool EnabledToggleShift;
+    public bool EnabledToggleAlt;
+
     public bool HideNpcs { get; set; }
     public bool HideEnemies { get; set; }
     public bool HideMinions { get; set; }
@@ -37,6 +42,10 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
 
     /// <summary>Keep NPCs showing a quest marker (!/?).</summary>
     public bool KeepQuestGivers { get; set; }
+
+    public bool HideOwnMinions { get; set; }
+    public bool HideOwnPets { get; set; }
+    public bool HideOwnChocobos { get; set; }
 
     /// <summary>Hold-keybind (VK code, 0 = unbound): while held, named NPCs reappear.</summary>
     public int HoldKey;
@@ -80,13 +89,52 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
     public bool HoldShiftPlayers;
     public bool HoldAltPlayers;
 
-    /// <summary>Hold-keybind: while held, red dots mark hidden players. Always hold behavior.</summary>
+    /// <summary>Hotkey: red dots mark hidden players. Follows Hotkey Mode like group hotkeys.</summary>
     public int DotsKey;
     public bool DotsCtrl;
     public bool DotsShift;
     public bool DotsAlt;
 
+    /// <summary>One voidlisted player: always hidden while VoidEnabled.</summary>
+    public class VoidEntry
+    {
+        public string Name { get; set; } = string.Empty;
+        public ushort World { get; set; }
+    }
+
     public HotkeyMode HotkeyMode;
+
+    /// <summary>Voidlist master switch.</summary>
+    public bool VoidEnabled;
+
+    public List<VoidEntry> VoidList { get; set; } = [];
+
+    /// <summary>Hold 3s on a targeted player to voidlist them.</summary>
+    public int VoidKey;
+    public bool VoidCtrl;
+    public bool VoidShift;
+    public bool VoidAlt;
+
+    /// <summary>When true, the hold-to-void uses mouse hover target instead of hard target.</summary>
+    public bool VoidOnMouseHover;
+
+    // WhiteList: same shape as VoidList but never hidden, no VFX, green hold rect.
+    public class WhiteEntry
+    {
+        public string Name { get; set; } = string.Empty;
+        public ushort World { get; set; }
+    }
+
+    public bool WhiteEnabled;
+
+    public List<WhiteEntry> WhiteList { get; set; } = [];
+
+    public int WhiteKey;
+    public bool WhiteCtrl;
+    public bool WhiteShift;
+    public bool WhiteAlt;
+
+    public bool WhiteOnMouseHover;
 
     /// <summary>TerritoryType RowIds the hiding applies to. Empty = hiding applies nowhere.</summary>
     public List<uint> ZoneIds { get; set; } = [];
@@ -95,7 +143,7 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
     public Dictionary<uint, ZoneOverride> ZoneOverrides { get; set; } = [];
 
     /// <summary>Provenance stamp so shared configs can be traced to a build.</summary>
-    public string BuildTag = "0.1.0.18";
+    public string BuildTag = "0.1.0.19";
 
     public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

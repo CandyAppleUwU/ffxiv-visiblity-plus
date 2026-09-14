@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.Command;
+using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 
@@ -11,7 +14,7 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
 {
     public string Name => "Visibility Plus";
 
-    public const string BuildTag = "0.1.0.18";
+    public const string BuildTag = "0.1.0.19";
 
     private const string Command = "/vplus";
 
@@ -39,6 +42,8 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
         Service.PluginInterface.UiBuilder.Draw += this.DrawUi;
         Service.PluginInterface.UiBuilder.OpenConfigUi += this.OpenConfig;
         Service.Framework.Update += this.controller.OnUpdate;
+        Service.Framework.Update += this.UpdateVoidPending;
+        Service.ContextMenu.OnMenuOpened += this.OnContextMenuOpened;
 
         Service.CommandManager.AddHandler(Command, new CommandInfo(this.OnCommand)
         {
@@ -109,9 +114,14 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
             uint zone = Service.ClientState.TerritoryType;
             string group = VisibilityController.ClassifyGroup(kind, sub);
             if (kind == (byte)Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc)
-                group = this.config.HideNonSyncedPlayers && this.config.HideAllPlayers
-                    ? "Players (all hidden)"
-                    : this.controller.IsSynced(target.Address) ? "Synced player (kept)" : "Non-Synced Players";
+            {
+                if (this.controller.IsVoidlisted(VisibilityController.BuildVoidKey(go)))
+                    group = "Voidlisted (hidden)";
+                else if (this.config.HideNonSyncedPlayers && this.config.HideAllPlayers)
+                    group = "Players (all hidden)";
+                else
+                    group = this.controller.IsSynced(target.Address) ? "Synced player (kept)" : "Non-Synced Players";
+            }
             string line1 = $"[V+] Target: {target.Name}  id={target.EntityId} (0x{target.EntityId:X})";
             string line2 = $"[V+] Kind: {kindName} ({kind})  sub={subName} ({sub})  wrapper={target.GetType().Name}  nameId={chr->NameId}  named={VisibilityController.HasName(go)}  lvl={chr->Level}  icon={go->NamePlateIconId}";
             string line3 = $"[V+] owner={go->OwnerId}  companionOwner={chr->CompanionOwnerId}  flags={go->RenderFlags}  alpha={chr->Alpha}";
@@ -134,34 +144,661 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
     {
         this.windowSystem.Draw();
         this.DrawDots();
+        this.DrawVoidAdd();
+        this.DrawWhiteAdd();
     }
 
-    /// <summary>Red dots at hidden players while the dots key is held. Overlay only.</summary>
-    private void DrawDots()
+    private long voidHoldStart;
+    private uint voidHoldTarget;
+    private bool voidNeedRelease;
+
+    // Pending voidlist VFX sequence: chain 0-2.6s, sound at 2.4s, burst at 2.5s, chain stop 2.6s, hide 2.8s.
+    private const string ChainVfxPath = "vfx/common/eff/m0731_stloop_chain.avfx";
+    private const string BurstVfxPath = "vfx/aoz/mgc_rod056/eff/mgc_rod056t0n1.avfx";
+
+    private sealed class PendingVoid
     {
-        if (!this.config.Enabled || this.config.DotsKey == 0)
+        public string Name = string.Empty;
+        public ushort World;
+        public long StartTick;
+        public nint TargetAddress;
+        public uint TargetEntityId;
+        public nint ChainVfxPtr;
+        public bool SoundPlayed;
+        public bool SecondSpawned;
+        public bool ChainStopped;
+    }
+
+    private readonly List<PendingVoid> pendingVoids = [];
+    private readonly object pendingLock = new();
+
+    private string? pendingUnvoidName;
+    private ushort pendingUnvoidWorld;
+    private System.Numerics.Vector2 pendingUnvoidPos;
+    private bool prevRightDown;
+
+    // WhiteList hold (green rect, no VFX, instant)
+    private long whiteHoldStart;
+    private uint whiteHoldTarget;
+    private bool whiteNeedRelease;
+    private string? pendingWhiteName;
+    private ushort pendingWhiteWorld;
+    private System.Numerics.Vector2 pendingWhitePos;
+
+    /// <summary>Hold the void bind 3s on a targeted player to voidlist them, with progress square.</summary>
+    private void DrawVoidAdd()
+    {
+        bool down = this.config.VoidEnabled && this.config.VoidKey != 0
+            && HoldKeybind.IsDown(this.config.VoidKey)
+            && (!this.config.VoidCtrl || HoldKeybind.IsDown(HoldKeybind.VK_CONTROL))
+            && (!this.config.VoidShift || HoldKeybind.IsDown(HoldKeybind.VK_SHIFT))
+            && (!this.config.VoidAlt || HoldKeybind.IsDown(HoldKeybind.VK_MENU));
+        if (!down || ImGui.GetIO().WantTextInput)
+        {
+            this.voidHoldStart = 0;
+            if (!down)
+            {
+                this.voidNeedRelease = false;
+                this.voidHoldTarget = 0; // forget target so re-holding restarts the 3s
+            }
             return;
-        if (!HoldKeybind.IsDown(this.config.DotsKey))
+        }
+        if (this.voidNeedRelease)
+            return; // added already: release the key before adding another
+
+        var local = Service.ObjectTable.LocalPlayer;
+        IPlayerCharacter? target = this.config.VoidOnMouseHover
+            ? Service.TargetManager.MouseOverTarget as IPlayerCharacter
+            : Service.TargetManager.Target as IPlayerCharacter;
+        if (target == null || local == null || target.Address == local.Address)
+        {
+            this.voidHoldStart = 0;
             return;
-        if (this.config.DotsCtrl && !HoldKeybind.IsDown(HoldKeybind.VK_CONTROL))
+        }
+        if (target.EntityId != this.voidHoldTarget)
+        {
+            this.voidHoldTarget = target.EntityId;
+            this.voidHoldStart = Environment.TickCount64;
+        }
+
+        const long showAfterMs = 500;
+        const long needMs = 3000;
+        long held = Environment.TickCount64 - this.voidHoldStart;
+        if (held < showAfterMs)
+            return; // square appears after 0.5s; total 3.5s to add
+        float frac = Math.Min(1f, (held - showAfterMs) / (float)needMs);
+
+        var feet = target.Position;
+        var head = new System.Numerics.Vector3(feet.X, feet.Y + 2f, feet.Z);
+        if (Service.GameGui.WorldToScreen(feet, out var feetScreen)
+            && Service.GameGui.WorldToScreen(head, out var headScreen))
+        {
+            float heightPx = System.Math.Abs(feetScreen.Y - headScreen.Y);
+            if (heightPx >= 4f && heightPx <= 10000f)
+            {
+                float widthPx = heightPx * 0.6f;
+                if (widthPx >= 2f && widthPx <= 10000f)
+                {
+                    float left = feetScreen.X - widthPx * 0.5f;
+                    float top = feetScreen.Y - heightPx;
+                    var dl = ImGui.GetBackgroundDrawList();
+                    dl.AddRect(new System.Numerics.Vector2(left, top), new System.Numerics.Vector2(left + widthPx, feetScreen.Y), 0xFF0000FF, 0f, ImDrawFlags.None, 2f);
+                    if (frac > 0f)
+                        dl.AddRectFilled(new System.Numerics.Vector2(left, top), new System.Numerics.Vector2(left + widthPx * frac, feetScreen.Y), 0x640000FF);
+                }
+            }
+        }
+
+        if (held >= showAfterMs + needMs)
+        {
+            this.AddVoidFromPlayer(target.Name.TextValue, (ushort)target.HomeWorld.RowId, target.Address, target.EntityId);
+            this.voidNeedRelease = true;
+            this.voidHoldStart = 0;
+        }
+    }
+
+    /// <summary>Hold the white bind 3s on a targeted player to whitelist them, with green progress square. No VFX.</summary>
+    private void DrawWhiteAdd()
+    {
+        bool down = this.config.WhiteEnabled && this.config.WhiteKey != 0
+            && HoldKeybind.IsDown(this.config.WhiteKey)
+            && (!this.config.WhiteCtrl || HoldKeybind.IsDown(HoldKeybind.VK_CONTROL))
+            && (!this.config.WhiteShift || HoldKeybind.IsDown(HoldKeybind.VK_SHIFT))
+            && (!this.config.WhiteAlt || HoldKeybind.IsDown(HoldKeybind.VK_MENU));
+        if (!down || ImGui.GetIO().WantTextInput)
+        {
+            this.whiteHoldStart = 0;
+            if (!down)
+            {
+                this.whiteNeedRelease = false;
+                this.whiteHoldTarget = 0;
+            }
             return;
-        if (this.config.DotsShift && !HoldKeybind.IsDown(HoldKeybind.VK_SHIFT))
-            return;
-        if (this.config.DotsAlt && !HoldKeybind.IsDown(HoldKeybind.VK_MENU))
-            return;
-        if (ImGui.GetIO().WantTextInput)
+        }
+        if (this.whiteNeedRelease)
             return;
 
-        var points = this.controller.GetDotPositions();
-        if (points.Length == 0)
+        var local = Service.ObjectTable.LocalPlayer;
+        IPlayerCharacter? target = this.config.WhiteOnMouseHover
+            ? Service.TargetManager.MouseOverTarget as IPlayerCharacter
+            : Service.TargetManager.Target as IPlayerCharacter;
+        if (target == null || local == null || target.Address == local.Address)
+        {
+            this.whiteHoldStart = 0;
+            return;
+        }
+        if (target.EntityId != this.whiteHoldTarget)
+        {
+            this.whiteHoldTarget = target.EntityId;
+            this.whiteHoldStart = Environment.TickCount64;
+        }
+
+        const long showAfterMs = 500;
+        const long needMs = 3000;
+        long held = Environment.TickCount64 - this.whiteHoldStart;
+        if (held < showAfterMs)
+            return;
+        float frac = Math.Min(1f, (held - showAfterMs) / (float)needMs);
+
+        var feet = target.Position;
+        var head = new System.Numerics.Vector3(feet.X, feet.Y + 2f, feet.Z);
+        if (Service.GameGui.WorldToScreen(feet, out var feetScreen)
+            && Service.GameGui.WorldToScreen(head, out var headScreen))
+        {
+            float heightPx = System.Math.Abs(feetScreen.Y - headScreen.Y);
+            if (heightPx >= 4f && heightPx <= 10000f)
+            {
+                float widthPx = heightPx * 0.6f;
+                if (widthPx >= 2f && widthPx <= 10000f)
+                {
+                    float left = feetScreen.X - widthPx * 0.5f;
+                    float top = feetScreen.Y - heightPx;
+                    var dl = ImGui.GetBackgroundDrawList();
+                    dl.AddRect(new System.Numerics.Vector2(left, top), new System.Numerics.Vector2(left + widthPx, feetScreen.Y), 0xFF00FF00, 0f, ImDrawFlags.None, 2f);
+                    if (frac > 0f)
+                        dl.AddRectFilled(new System.Numerics.Vector2(left, top), new System.Numerics.Vector2(left + widthPx * frac, feetScreen.Y), 0x6400FF00);
+                }
+            }
+        }
+
+        if (held >= showAfterMs + needMs)
+        {
+            this.AddWhiteFromPlayer(target.Name.TextValue, (ushort)target.HomeWorld.RowId);
+            this.whiteNeedRelease = true;
+            this.whiteHoldStart = 0;
+        }
+    }
+
+    private const uint SndAsync = 0x1;
+    private const uint SndFilename = 0x20000;
+    private static bool voidSoundMissingLogged;
+
+    [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+    private static extern bool PlaySound(string pszSound, nint hmod, uint fdwSound);
+
+    private static string VoidSoundPath
+    {
+        get
+        {
+            try
+            {
+                // Plugin dir = folder containing the dll (devPlugins or installed plugin dir).
+                // AssemblyLocation is FileInfo (Dalamud API 15) — be defensive via object cast.
+                object? locObj = Service.PluginInterface.AssemblyLocation;
+                string? dir = null;
+                if (locObj is System.IO.FileInfo fi) dir = fi.DirectoryName;
+                else if (locObj is System.IO.DirectoryInfo di) dir = di.FullName;
+                else if (locObj != null) dir = System.IO.Path.GetDirectoryName(locObj.ToString());
+                if (string.IsNullOrEmpty(dir))
+                    dir = System.IO.Path.GetDirectoryName(typeof(VisibilityPlusPlugin).Assembly.Location);
+                if (!string.IsNullOrEmpty(dir))
+                    return System.IO.Path.Combine(dir, "scream.wav");
+            }
+            catch
+            {
+            }
+            return "scream.wav";
+        }
+    }
+
+    private static void PlayVoidSound()
+    {
+        try
+        {
+            string path = VoidSoundPath;
+            if (!System.IO.File.Exists(path))
+            {
+                if (!voidSoundMissingLogged)
+                {
+                    voidSoundMissingLogged = true;
+                    Service.PluginLog.Warning("[Visibility Plus] Void sound missing: " + path);
+                }
+                return;
+            }
+            PlaySound(path, nint.Zero, SndAsync | SndFilename);
+        }
+        catch
+        {
+        }
+    }
+
+    private void AddVoidFromPlayer(string name, ushort world, nint targetAddress = 0, uint entityId = 0)
+    {
+        string key = name + "@" + world;
+        // Already voidlisted or already pending — refuse with why.
+        if (this.controller.IsVoidlisted(key))
+        {
+            Service.ChatGui.Print($"[Visibility Plus] {name} is already voidlisted.");
+            return;
+        }
+        lock (this.pendingLock)
+        {
+            foreach (var p in this.pendingVoids)
+                if (p.Name == name && p.World == world)
+                {
+                    Service.ChatGui.Print($"[Visibility Plus] {name} is already being voidlisted.");
+                    return;
+                }
+        }
+
+        // Resolve target address if caller didn't pass it (fallback to current target).
+        if (targetAddress == nint.Zero)
+        {
+            try
+            {
+                var t = Service.TargetManager.Target as IPlayerCharacter ?? Service.ObjectTable.LocalPlayer as IPlayerCharacter;
+                // Try to find by name/world in object table as last resort
+                if (t != null && t.Name.TextValue == name && (ushort)t.HomeWorld.RowId == world)
+                {
+                    targetAddress = t.Address;
+                    entityId = t.EntityId;
+                }
+                else
+                {
+                    foreach (var obj in Service.ObjectTable)
+                    {
+                        if (obj is IPlayerCharacter pc && pc.Name.TextValue == name && (ushort)pc.HomeWorld.RowId == world)
+                        {
+                            targetAddress = pc.Address;
+                            entityId = pc.EntityId;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        var pending = new PendingVoid
+        {
+            Name = name,
+            World = world,
+            StartTick = Environment.TickCount64,
+            TargetAddress = targetAddress,
+            TargetEntityId = entityId,
+        };
+
+        // Spawn chain VFX immediately on the target actor (follows them).
+        nint chainPtr = nint.Zero;
+        bool spawned = false;
+        if (targetAddress != nint.Zero)
+            spawned = VfxHelper.TrySpawnOnActor(ChainVfxPath, targetAddress, targetAddress, out chainPtr);
+        pending.ChainVfxPtr = chainPtr;
+
+        lock (this.pendingLock)
+            this.pendingVoids.Add(pending);
+
+        if (spawned)
+            Service.PluginLog.Info($"[Visibility Plus] Chain VFX on {name}@{WorldName(world)} ptr=0x{chainPtr:X}");
+        else
+            Service.PluginLog.Warning($"[Visibility Plus] Chain VFX failed for {name}@{WorldName(world)} — will still hide after delay.");
+
+        Service.ChatGui.Print($"[Visibility Plus] Voidlisting {name}@{WorldName(world)}...");
+    }
+
+    private void AddWhiteFromPlayer(string name, ushort world)
+    {
+        string key = name + "@" + world;
+        if (this.controller.IsWhiteListed(key))
+        {
+            Service.ChatGui.Print($"[Visibility Plus] {name} is already whitelisted.");
+            return;
+        }
+        if (this.controller.AddWhite(name, world))
+            Service.ChatGui.Print($"[Visibility Plus] Whitelisted {name}@{WorldName(world)} (never hidden).");
+        else
+            Service.ChatGui.Print($"[Visibility Plus] {name} is already whitelisted.");
+    }
+
+    private void UpdateVoidPending(Dalamud.Plugin.Services.IFramework framework)
+    {
+        try
+        {
+            if (this.pendingVoids.Count == 0)
+                return;
+            long now = Environment.TickCount64;
+            List<PendingVoid> toRemove = new();
+            lock (this.pendingLock)
+            {
+                foreach (var p in this.pendingVoids)
+                {
+                    long elapsed = now - p.StartTick;
+
+                    // 2.4s: sound 0.1s before burst.
+                    if (elapsed >= 2400 && !p.SoundPlayed)
+                    {
+                        p.SoundPlayed = true;
+                        PlayVoidSound();
+                    }
+
+                    // 2.5s: burst VFX. Resolve current address (target may have moved/despawned).
+                    if (elapsed >= 2500 && !p.SecondSpawned)
+                    {
+                        p.SecondSpawned = true;
+                        nint addr = this.ResolvePendingTarget(p);
+                        if (addr != nint.Zero)
+                        {
+                            nint burstPtr = nint.Zero;
+                            if (VfxHelper.TrySpawnOnActor(BurstVfxPath, addr, addr, out burstPtr))
+                                Service.PluginLog.Info($"[Visibility Plus] Burst VFX on {p.Name} ptr=0x{burstPtr:X}");
+                        }
+                    }
+
+                    // 2.6s: stop chain (0.1s after burst, 0.2s after sound).
+                    if (elapsed >= 2600 && !p.ChainStopped)
+                    {
+                        p.ChainStopped = true;
+                        if (p.ChainVfxPtr != nint.Zero)
+                        {
+                            VfxHelper.TryRemove(p.ChainVfxPtr);
+                            p.ChainVfxPtr = nint.Zero;
+                        }
+                    }
+
+                    // 2.8s: actually voidlist and hide (0.2s after chain stop).
+                    if (elapsed >= 2800)
+                    {
+                        if (this.controller.AddVoid(p.Name, p.World))
+                            Service.ChatGui.Print($"[Visibility Plus] Voidlisted {p.Name}@{WorldName(p.World)}.");
+                        else
+                            Service.ChatGui.Print($"[Visibility Plus] {p.Name} is already voidlisted.");
+                        toRemove.Add(p);
+                    }
+                }
+
+                foreach (var r in toRemove)
+                    this.pendingVoids.Remove(r);
+            }
+        }
+        catch (Exception ex)
+        {
+            Service.PluginLog.Warning($"[Visibility Plus] UpdateVoidPending failed: {ex.Message}");
+        }
+    }
+
+    private nint ResolvePendingTarget(PendingVoid p)
+    {
+        try
+        {
+            // Prefer original address if it still points to same entityId.
+            if (p.TargetAddress != nint.Zero)
+            {
+                try
+                {
+                    unsafe
+                    {
+                        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)p.TargetAddress;
+                        if (go != null && go->EntityId == p.TargetEntityId)
+                            return p.TargetAddress;
+                    }
+                }
+                catch { }
+            }
+            // Fallback: find by entityId then by name/world.
+            if (p.TargetEntityId != 0)
+            {
+                var byId = Service.ObjectTable.SearchByEntityId(p.TargetEntityId);
+                if (byId != null)
+                    return byId.Address;
+            }
+            foreach (var obj in Service.ObjectTable)
+            {
+                if (obj is IPlayerCharacter pc && pc.Name.TextValue == p.Name && (ushort)pc.HomeWorld.RowId == p.World)
+                    return pc.Address;
+            }
+        }
+        catch { }
+        return nint.Zero;
+    }
+
+    private static string WorldName(ushort worldId)
+    {
+        try
+        {
+            var name = Service.DataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRow(worldId).Name.ToString();
+            if (!string.IsNullOrEmpty(name))
+                return name;
+        }
+        catch
+        {
+        }
+        return worldId.ToString();
+    }
+
+    private void OnContextMenuOpened(IMenuOpenedArgs args)
+    {
+        try
+        {
+            if (args.MenuType != ContextMenuType.Default || args.Target is not MenuTargetDefault target)
+                return;
+            if (target.TargetObject is not IPlayerCharacter pc)
+                return;
+            var local = Service.ObjectTable.LocalPlayer;
+            if (local == null || pc.Address == local.Address)
+                return;
+            string name = pc.Name.TextValue;
+            ushort world = (ushort)pc.HomeWorld.RowId;
+            nint addr = pc.Address;
+            uint eid = pc.EntityId;
+            args.AddMenuItem(new MenuItem
+            {
+                Name = "Add to VoidList (vPlus)",
+                OnClicked = _ => this.AddVoidFromPlayer(name, world, addr, eid),
+            });
+            string whiteKey = name + "@" + world;
+            bool isWhite = this.controller.IsWhiteListed(whiteKey);
+            if (isWhite)
+            {
+                args.AddMenuItem(new MenuItem
+                {
+                    Name = "Remove from WhiteList (vPlus)",
+                    OnClicked = _ =>
+                    {
+                        for (int i = 0; i < this.config.WhiteList.Count; i++)
+                        {
+                            var e = this.config.WhiteList[i];
+                            if (e.Name == name && e.World == world)
+                            {
+                                this.controller.RemoveWhiteAt(i);
+                                Service.ChatGui.Print($"[Visibility Plus] Removed {name}@{WorldName(world)} from WhiteList.");
+                                break;
+                            }
+                        }
+                    },
+                });
+            }
+            else
+            {
+                args.AddMenuItem(new MenuItem
+                {
+                    Name = "Add to WhiteList (vPlus)",
+                    OnClicked = _ => this.AddWhiteFromPlayer(name, world),
+                });
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>Dots at hidden players. Cyan=semi hidden, Red=voidlisted. Name above. Right-click red to unVoid.</summary>
+    private void DrawDots()
+    {
+        // Track right mouse every frame even when dots not visible, for edge detection
+        bool rightDown = HoldKeybind.IsDown(0x02); // VK_RBUTTON
+        bool rightClicked = rightDown && !this.prevRightDown;
+        bool rightReleased = !rightDown && this.prevRightDown;
+        this.prevRightDown = rightDown;
+        bool imGuiRight = ImGui.IsMouseClicked(ImGuiMouseButton.Right) || ImGui.IsMouseReleased(ImGuiMouseButton.Right);
+
+        if (!this.controller.DotsVisible)
+            return;
+
+        var infos = this.controller.GetDotInfos();
+        if (infos.Length == 0)
             return;
         var drawList = ImGui.GetBackgroundDrawList();
-        foreach (var p in points)
+        var mousePos = ImGui.GetMousePos();
+        // First pass: find closest dot (void or hidden) within click radius (dot + name text) for right-click
+        int hoveredIdx = -1;
+        System.Numerics.Vector2 hoveredScreen = default;
+        VisibilityController.DotInfo hoveredInfo = default;
+        float bestDist = 30f;
+        bool hasAny = false;
+        for (int idx = 0; idx < infos.Length; idx++)
         {
-            if (!Service.GameGui.WorldToScreen(p, out var screen))
+            var info = infos[idx];
+            if (!Service.GameGui.WorldToScreen(info.Position, out var screen)) continue;
+            hasAny = true;
+            float dist = (mousePos - screen).Length();
+            bool hoverThis = dist < 28f;
+            if (!hoverThis && !string.IsNullOrEmpty(info.Name))
+            {
+                var baseTs = ImGui.CalcTextSize(info.Name);
+                var textSize = baseTs * 1.30f;
+                var textPos = new System.Numerics.Vector2(screen.X - textSize.X * 0.5f, screen.Y - 14f - textSize.Y);
+                if (mousePos.X >= textPos.X - 6 && mousePos.X <= textPos.X + textSize.X + 6
+                    && mousePos.Y >= textPos.Y - 4 && mousePos.Y <= textPos.Y + textSize.Y + 4)
+                {
+                    hoverThis = true;
+                    dist = 0f;
+                }
+            }
+            if (hoverThis && dist < bestDist)
+            {
+                bestDist = dist;
+                hoveredIdx = idx;
+                hoveredScreen = screen;
+                hoveredInfo = info;
+            }
+        }
+        bool hoveredFound = hoveredIdx != -1;
+
+        var local = Service.ObjectTable.LocalPlayer;
+        // Second pass: draw all dots, highlight hovered (both void red and hidden cyan)
+        for (int idx = 0; idx < infos.Length; idx++)
+        {
+            var info = infos[idx];
+            if (!Service.GameGui.WorldToScreen(info.Position, out var screen))
                 continue;
-            drawList.AddCircleFilled(screen, 6f, 0xFF0000FF);
-            drawList.AddCircle(screen, 6f, 0xFF000000, 16, 1.5f);
+            bool isHovered = hoveredFound && idx == hoveredIdx;
+            uint fill = info.IsVoid ? 0xAA0000FFu : 0xAAFFFF00u;
+            uint outline = isHovered ? 0xFFFFFFFFu : 0xAA000000u;
+            float radius = isHovered ? 8f : 6f;
+            drawList.AddCircleFilled(screen, radius, fill);
+            drawList.AddCircle(screen, radius, outline, 16, isHovered ? 2.2f : 1.5f);
+
+            if (!string.IsNullOrEmpty(info.Name) && local != null)
+            {
+                float dist = System.Numerics.Vector3.Distance(local.Position, info.Position);
+                if (dist > 35f) continue;
+                var font = ImGui.GetFont();
+                float bigSize = ImGui.GetFontSize() * 1.30f;
+                var baseSize = ImGui.CalcTextSize(info.Name);
+                var textSize = baseSize * 1.30f;
+                var textPos = new System.Numerics.Vector2(screen.X - textSize.X * 0.5f, screen.Y - 14f - textSize.Y - (isHovered ? 2f : 0f));
+                uint nameCol = info.IsVoid ? 0xFF0000FFu : 0xFFFFFF00u;
+                drawList.AddText(font, bigSize, textPos + new System.Numerics.Vector2(1, 1), 0xAA000000u, info.Name);
+                drawList.AddText(font, bigSize, textPos, nameCol, info.Name);
+            }
+        }
+
+        // Right-click on dot -> void: unVoid, hidden (cyan): add to whitelist
+        if (hasAny && hoveredFound && (rightClicked || rightReleased || imGuiRight))
+        {
+            if (!ImGui.GetIO().WantTextInput)
+            {
+                if (hoveredInfo.IsVoid)
+                {
+                    this.pendingUnvoidName = hoveredInfo.Name;
+                    this.pendingUnvoidWorld = hoveredInfo.World;
+                    this.pendingUnvoidPos = hoveredScreen + new System.Numerics.Vector2(12, 12);
+                    this.pendingWhiteName = null; // clear other
+                    ImGui.OpenPopup("##unvoidPopup");
+                    Service.PluginLog.Info($"[Visibility Plus] unVoid popup for {hoveredInfo.Name}@{hoveredInfo.World}");
+                }
+                else
+                {
+                    this.pendingWhiteName = hoveredInfo.Name;
+                    this.pendingWhiteWorld = hoveredInfo.World;
+                    this.pendingWhitePos = hoveredScreen + new System.Numerics.Vector2(12, 12);
+                    this.pendingUnvoidName = null;
+                    ImGui.OpenPopup("##whitePopup");
+                    Service.PluginLog.Info($"[Visibility Plus] white popup for {hoveredInfo.Name}@{hoveredInfo.World}");
+                }
+            }
+        }
+
+        if (this.pendingUnvoidName != null)
+            ImGui.SetNextWindowPos(this.pendingUnvoidPos, ImGuiCond.Appearing);
+        if (ImGui.BeginPopup("##unvoidPopup"))
+        {
+            string label = this.pendingUnvoidName != null
+                ? $"{this.pendingUnvoidName}@{WorldName(this.pendingUnvoidWorld)}"
+                : "Unknown";
+            ImGui.Text(label);
+            if (ImGui.Button("unVoid"))
+            {
+                if (this.pendingUnvoidName != null)
+                {
+                    for (int i = 0; i < this.config.VoidList.Count; i++)
+                    {
+                        var e = this.config.VoidList[i];
+                        if (e.Name == this.pendingUnvoidName && e.World == this.pendingUnvoidWorld)
+                        {
+                            this.controller.RemoveVoidAt(i);
+                            Service.ChatGui.Print($"[Visibility Plus] Un-voidlisted {label}.");
+                            break;
+                        }
+                    }
+                    this.pendingUnvoidName = null;
+                }
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.EndPopup();
+        }
+
+        if (this.pendingWhiteName != null)
+            ImGui.SetNextWindowPos(this.pendingWhitePos, ImGuiCond.Appearing);
+        if (ImGui.BeginPopup("##whitePopup"))
+        {
+            string label = this.pendingWhiteName != null
+                ? $"{this.pendingWhiteName}@{WorldName(this.pendingWhiteWorld)}"
+                : "Unknown";
+            ImGui.Text(label);
+            if (ImGui.Button("Add to WhiteList"))
+            {
+                if (this.pendingWhiteName != null)
+                {
+                    if (this.controller.AddWhite(this.pendingWhiteName, this.pendingWhiteWorld))
+                        Service.ChatGui.Print($"[Visibility Plus] Whitelisted {label} (never hidden).");
+                    else
+                        Service.ChatGui.Print($"[Visibility Plus] {label} is already whitelisted.");
+                    this.pendingWhiteName = null;
+                }
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.EndPopup();
         }
     }
 
@@ -192,10 +829,20 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
 
     public void Dispose()
     {
+        Service.ContextMenu.OnMenuOpened -= this.OnContextMenuOpened;
         Service.CommandManager.RemoveHandler(Command);
         Service.Framework.Update -= this.controller.OnUpdate;
+        Service.Framework.Update -= this.UpdateVoidPending;
         Service.PluginInterface.UiBuilder.Draw -= this.DrawUi;
         Service.PluginInterface.UiBuilder.OpenConfigUi -= this.OpenConfig;
+        // Clean up any looping chain VFX still active
+        lock (this.pendingLock)
+        {
+            foreach (var p in this.pendingVoids)
+                if (p.ChainVfxPtr != nint.Zero)
+                    VfxHelper.TryRemove(p.ChainVfxPtr);
+            this.pendingVoids.Clear();
+        }
         this.windowSystem.RemoveAllWindows();
         this.controller.Dispose();
         GC.SuppressFinalize(this);

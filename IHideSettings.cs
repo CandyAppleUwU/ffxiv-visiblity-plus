@@ -29,4 +29,7 @@ public interface IHideSettings
     bool KeepFcChocobos { get; set; }
     bool KeepAggroEnemies { get; set; }
     bool KeepQuestGivers { get; set; }
+    bool HideOwnMinions { get; set; }
+    bool HideOwnPets { get; set; }
+    bool HideOwnChocobos { get; set; }
 }

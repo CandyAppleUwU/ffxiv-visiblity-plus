@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin.Ipc;
@@ -30,10 +32,14 @@ public sealed class VisibilityController : IDisposable
     private readonly Dictionary<nint, VisibilityFlags> hidden = new(256);
 
     // Toggle-mode latch state (per group). Not persisted; zone exits reset them.
-    private bool latchedNpcs, latchedEnemies, latchedMinions, latchedPets, latchedChocobos, latchedPlayers;
-    private bool prevNpcs, prevEnemies, prevMinions, prevPets, prevChocobos, prevPlayers;
-    private long untilNpcs, untilEnemies, untilMinions, untilPets, untilChocobos, untilPlayers;
+    private bool latchedNpcs, latchedEnemies, latchedMinions, latchedPets, latchedChocobos, latchedPlayers, latchedDots;
+    private bool prevNpcs, prevEnemies, prevMinions, prevPets, prevChocobos, prevPlayers, prevDots;
+    private long untilNpcs, untilEnemies, untilMinions, untilPets, untilChocobos, untilPlayers, untilDots;
     private const long Toggle30sMs = 30_000;
+    private bool prevEnabledToggle;
+
+    /// <summary>Dots overlay flag, computed on the framework thread, read by the UI thread.</summary>
+    public bool DotsVisible;
 
     // Sync state from Snowcloak and/or Mare, polled throttled over IPC. Never
     // latched: a failed poll goes stale instead, and stale data hides nothing.
@@ -55,10 +61,22 @@ public sealed class VisibilityController : IDisposable
         public long NextRetryAt;
     }
 
-    // Hidden-player positions for the dots overlay. Written on the framework
-    // thread, copied under lock by the UI thread. Rebuilt every active frame.
-    private readonly List<System.Numerics.Vector3> dotPositions = [];
+    public readonly struct DotInfo
+    {
+        public readonly System.Numerics.Vector3 Position;
+        public readonly bool IsVoid;
+        public readonly string Name;
+        public readonly ushort World;
+        public DotInfo(System.Numerics.Vector3 pos, bool isVoid, string name, ushort world = 0) { this.Position = pos; this.IsVoid = isVoid; this.Name = name; this.World = world; }
+    }
+
+    // Hidden-player dots overlay. Written on the framework thread, copied under lock by UI thread. Rebuilt every active frame.
+    private readonly List<DotInfo> dotInfos = [];
     private readonly object dotLock = new();
+    // Kept for compat -- old callers.
+    private readonly List<System.Numerics.Vector3> dotPositions = [];
+    private readonly Dictionary<string, System.Numerics.Vector3> dotSmoothed = new();
+    private readonly HashSet<string> dotSeenKeys = new();
 
     // Immutable snapshot so Framework.Update never enumerates a list the UI thread may mutate.
     private HashSet<uint> zoneSnapshot = [];
@@ -70,6 +88,8 @@ public sealed class VisibilityController : IDisposable
     {
         this.config = config;
         this.RefreshZoneSnapshot();
+        this.RefreshVoidKeys();
+        this.RefreshWhiteKeys();
         this.syncSources.Add(new SyncSource { Name = "Snowcloak", Subscriber = Service.PluginInterface.GetIpcSubscriber<List<nint>>("Snowcloak.GetHandledAddresses") });
         this.syncSources.Add(new SyncSource { Name = "PSync", Subscriber = Service.PluginInterface.GetIpcSubscriber<List<nint>>("MareSynchronos.GetHandledAddresses") });
         this.syncSources.Add(new SyncSource { Name = "PSync", Subscriber = Service.PluginInterface.GetIpcSubscriber<List<nint>>("PlayerSync.GetHandledAddresses") });
@@ -150,6 +170,25 @@ public sealed class VisibilityController : IDisposable
     {
         try
         {
+            // Enabled toggle keybind (left of Enabled checkbox) - edge toggle, not hold
+            try
+            {
+                bool typing = false;
+                try { typing = ImGui.GetIO().WantTextInput; } catch {}
+                bool down = !typing && this.config.EnabledToggleKey != 0
+                    && HoldKeybind.IsDown(this.config.EnabledToggleKey)
+                    && (!this.config.EnabledToggleCtrl || HoldKeybind.IsDown(HoldKeybind.VK_CONTROL))
+                    && (!this.config.EnabledToggleShift || HoldKeybind.IsDown(HoldKeybind.VK_SHIFT))
+                    && (!this.config.EnabledToggleAlt || HoldKeybind.IsDown(HoldKeybind.VK_MENU));
+                if (down && !this.prevEnabledToggle)
+                {
+                    this.config.Enabled = !this.config.Enabled;
+                    this.config.Save();
+                }
+                this.prevEnabledToggle = down;
+            }
+            catch {}
+
             var client = Service.ClientState;
             var localPlayer = Service.ObjectTable.LocalPlayer;
             if (!client.IsLoggedIn || localPlayer == null)
@@ -162,14 +201,34 @@ public sealed class VisibilityController : IDisposable
             if (Service.Condition[ConditionFlag.BetweenAreas])
                 return;
 
+            var manager = GameObjectManager.Instance();
+            if (manager == null)
+                return;
+
+            uint localId = localPlayer.EntityId;
+            nint localAddr = localPlayer.Address;
+            var localChr = (Character*)localPlayer.Address;
+            uint examinedId = this.ExaminedPlayerId();
+
             if (!this.config.Enabled || !this.zoneSnapshot.Contains(territory))
             {
                 this.ResetHotkeyState();
                 this.wasFilterActive = false;
+                this.dotSeenKeys.Clear();
+                // Keep void smoothing across idle frames, but clear regular; pruning after ApplyVoidGlobal will drop stale regular keys
                 lock (this.dotLock)
+                {
                     this.dotPositions.Clear();
+                    this.dotInfos.Clear();
+                }
                 if (this.hidden.Count > 0)
                     this.ShowAll();
+                this.ApplyVoidGlobal(manager, localAddr, localId, examinedId);
+                // Prune any regular hidden keys that didn't reappear
+                var toRemoveEarly = new List<string>();
+                foreach (var k in this.dotSmoothed.Keys)
+                    if (!this.dotSeenKeys.Contains(k)) toRemoveEarly.Add(k);
+                foreach (var k in toRemoveEarly) this.dotSmoothed.Remove(k);
                 return;
             }
 
@@ -182,15 +241,6 @@ public sealed class VisibilityController : IDisposable
 
             IHideSettings s = this.ActiveFor(territory);
 
-            var manager = GameObjectManager.Instance();
-            if (manager == null)
-                return;
-
-            uint localId = localPlayer.EntityId;
-            nint localAddr = localPlayer.Address;
-            var localChr = (Character*)localPlayer.Address;
-            uint examinedId = this.ExaminedPlayerId();
-
             // Hotkeys: reveal the bound group per the global HotkeyMode.
             // Groups may share the same key, revealing everything at once.
             bool holdNpcs = this.HotkeyShows(ref this.latchedNpcs, ref this.prevNpcs, ref this.untilNpcs, this.config.HoldKey, this.config.HoldCtrl, this.config.HoldShift, this.config.HoldAlt);
@@ -198,12 +248,17 @@ public sealed class VisibilityController : IDisposable
             bool holdMinions = this.HotkeyShows(ref this.latchedMinions, ref this.prevMinions, ref this.untilMinions, this.config.HoldKeyMinions, this.config.HoldCtrlMinions, this.config.HoldShiftMinions, this.config.HoldAltMinions);
             bool holdPets = this.HotkeyShows(ref this.latchedPets, ref this.prevPets, ref this.untilPets, this.config.HoldKeyPets, this.config.HoldCtrlPets, this.config.HoldShiftPets, this.config.HoldAltPets);
             bool holdChocobos = this.HotkeyShows(ref this.latchedChocobos, ref this.prevChocobos, ref this.untilChocobos, this.config.HoldKeyChocobos, this.config.HoldCtrlChocobos, this.config.HoldShiftChocobos, this.config.HoldAltChocobos);
+            this.DotsVisible = this.HotkeyShows(ref this.latchedDots, ref this.prevDots, ref this.untilDots, this.config.DotsKey, this.config.DotsCtrl, this.config.DotsShift, this.config.DotsAlt);
             bool holdPlayers = this.HotkeyShows(ref this.latchedPlayers, ref this.prevPlayers, ref this.untilPlayers, this.config.HoldKeyPlayers, this.config.HoldCtrlPlayers, this.config.HoldShiftPlayers, this.config.HoldAltPlayers);
 
             this.PollSyncedPlayers();
 
+            this.dotSeenKeys.Clear();
             lock (this.dotLock)
+            {
                 this.dotPositions.Clear();
+                this.dotInfos.Clear();
+            }
 
             // Walk the WHOLE table, not just slots 0-199: slots 200+ hold
             // non-networked objects and slots 489+ hold lively actors, i.e.
@@ -234,6 +289,16 @@ public sealed class VisibilityController : IDisposable
                             this.Unhide(obj);
                             break;
                         }
+                        // Voidlisted players are owned by the global void pass below:
+                        // don't touch them here either way.
+                        if (this.config.VoidEnabled && this.voidKeys.Count > 0 && this.voidKeys.Contains(BuildVoidKey(obj)))
+                            break;
+                        // Whitelisted players are never hidden (vPlus white list).
+                        if (this.config.WhiteEnabled && this.whiteKeys.Count > 0 && this.whiteKeys.Contains(BuildWhiteKey(obj)))
+                        {
+                            this.Unhide(obj);
+                            break;
+                        }
                         // Local player already skipped by address above: never hide yourself.
                         bool hidePlayer = s.HideNonSyncedPlayers
                             && (s.HideAllPlayers || (this.SyncedDataFresh() && !this.syncedAddrs.Contains((nint)obj)));
@@ -246,8 +311,17 @@ public sealed class VisibilityController : IDisposable
                             if (this.Hide(obj))
                             {
                                 var p = obj->Position;
+                                string n = GetDotName(obj);
+                                ushort w = ((Character*)obj)->HomeWorld;
+                                string key = n + "@" + w + "_h";
+                                var raw = new System.Numerics.Vector3(p.X, p.Y, p.Z);
+                                var sp = this.SmoothDotPos(key, raw);
+                                this.dotSeenKeys.Add(key);
                                 lock (this.dotLock)
-                                    this.dotPositions.Add(new System.Numerics.Vector3(p.X, p.Y, p.Z));
+                                {
+                                    this.dotPositions.Add(sp);
+                                    this.dotInfos.Add(new DotInfo(sp, false, n, w));
+                                }
                             }
                         }
                         else this.Unhide(obj);
@@ -272,19 +346,27 @@ public sealed class VisibilityController : IDisposable
                         {
                             if (((Character*)obj)->NameId == 6565)
                                 break; // Earthly Star: combat visual, never touch
-                            if (obj->OwnerId == localId)
-                                break; // own pet
+                            bool isOwnPet = obj->OwnerId == localId;
+                            if (isOwnPet && !s.HideOwnPets)
+                            {
+                                this.Unhide(obj);
+                                break; // own pet (unless Self enabled)
+                            }
                             bool hidePet = s.HidePets && !holdPets
-                                && !this.OwnerExempt(obj->OwnerId, s.KeepFriendPets, s.KeepPartyPets, s.KeepFcPets, localChr);
+                                && (isOwnPet ? true : !this.OwnerExempt(obj->OwnerId, s.KeepFriendPets, s.KeepPartyPets, s.KeepFcPets, localChr));
                             if (hidePet) this.Hide(obj);
                             else this.Unhide(obj);
                         }
                         else if (sub == (byte)BattleNpcSubKind.Buddy)
                         {
-                            if (obj->OwnerId == localId)
-                                break; // own chocobo
+                            bool isOwnBoco = obj->OwnerId == localId;
+                            if (isOwnBoco && !s.HideOwnChocobos)
+                            {
+                                this.Unhide(obj);
+                                break; // own chocobo (unless Self enabled)
+                            }
                             bool hideBoco = s.HideChocobos && !holdChocobos
-                                && !this.OwnerExempt(obj->OwnerId, s.KeepFriendChocobos, s.KeepPartyChocobos, s.KeepFcChocobos, localChr);
+                                && (isOwnBoco ? true : !this.OwnerExempt(obj->OwnerId, s.KeepFriendChocobos, s.KeepPartyChocobos, s.KeepFcChocobos, localChr));
                             if (hideBoco) this.Hide(obj);
                             else this.Unhide(obj);
                         }
@@ -320,20 +402,104 @@ public sealed class VisibilityController : IDisposable
                         break;
 
                     case ObjectKind.Companion:
-                        if (((Character*)obj)->CompanionOwnerId == localId)
-                            break; // own minion
+                        bool isOwnMin = ((Character*)obj)->CompanionOwnerId == localId;
+                        if (isOwnMin && !s.HideOwnMinions)
+                        {
+                            this.Unhide(obj);
+                            break; // own minion (unless Self enabled)
+                        }
                         bool hideMinion = s.HideMinions && !holdMinions
-                            && !this.OwnerExempt(((Character*)obj)->CompanionOwnerId, s.KeepFriendMinions, s.KeepPartyMinions, s.KeepFcMinions, localChr);
+                            && (isOwnMin ? true : !this.OwnerExempt(((Character*)obj)->CompanionOwnerId, s.KeepFriendMinions, s.KeepPartyMinions, s.KeepFcMinions, localChr));
                         if (hideMinion) this.Hide(obj);
                         else this.Unhide(obj);
                         break;
                 }
             }
+
+            this.ApplyVoidGlobal(manager, localAddr, localId, examinedId);
+
+            // Prune smoothed cache for dots no longer present this frame
+            var toRemove = new List<string>();
+            foreach (var k in this.dotSmoothed.Keys)
+                if (!this.dotSeenKeys.Contains(k)) toRemove.Add(k);
+            foreach (var k in toRemove) this.dotSmoothed.Remove(k);
         }
         catch
         {
             // Never throw on the framework thread.
         }
+    }
+
+    /// <summary>Zone-independent voidlist pass: voidlisted players hide in every zone.</summary>
+    private unsafe void ApplyVoidGlobal(GameObjectManager* manager, nint localAddr, uint localId, uint examinedId)
+    {
+        if (!this.config.VoidEnabled || this.voidKeys.Count == 0)
+            return;
+        int slots = manager->Objects.IndexSorted.Length;
+        for (int i = 0; i < slots; ++i)
+        {
+            GameObject* obj = manager->Objects.IndexSorted[i];
+            if (obj == null || (nint)obj == localAddr)
+                continue;
+            if (obj->EntityId == 0 || obj->EntityId == localId || obj->EntityId == examinedId)
+                continue; // empty slot + the same preview-copy guards as the main loop
+            if (obj->ObjectIndex >= 200)
+                continue; // portrait/preview copies live outside the networked range
+            if ((ObjectKind)obj->ObjectKind != ObjectKind.Pc)
+                continue;
+            // White overrides void: never hide
+            if (this.config.WhiteEnabled && this.whiteKeys.Count > 0 && this.whiteKeys.Contains(BuildWhiteKey(obj)))
+            {
+                this.Unhide(obj);
+                continue;
+            }
+            if (!this.voidKeys.Contains(BuildVoidKey(obj)))
+                continue;
+            if (this.Hide(obj))
+            {
+                var p = obj->Position;
+                string n = GetDotName(obj);
+                ushort w = ((Character*)obj)->HomeWorld;
+                string key = n + "@" + w + "_v";
+                var raw = new System.Numerics.Vector3(p.X, p.Y, p.Z);
+                var sp = this.SmoothDotPos(key, raw);
+                this.dotSeenKeys.Add(key);
+                lock (this.dotLock)
+                {
+                    this.dotPositions.Add(sp);
+                    this.dotInfos.Add(new DotInfo(sp, true, n, w));
+                }
+            }
+        }
+    }
+
+    private static unsafe string GetDotName(GameObject* obj)
+    {
+        byte* name = (byte*)obj + 0x30;
+        int len = 0;
+        while (len < 64 && name[len] != 0) len++;
+        return len == 0 ? "Unknown" : Encoding.ASCII.GetString(name, len);
+    }
+
+    private System.Numerics.Vector3 SmoothDotPos(string key, System.Numerics.Vector3 raw)
+    {
+        if (!this.dotSmoothed.TryGetValue(key, out var prev))
+        {
+            this.dotSmoothed[key] = raw;
+            return raw;
+        }
+        float dist = System.Numerics.Vector3.Distance(prev, raw);
+        if (dist < 0.015f) return prev; // deadzone for standing micro jitter
+        // Smooth large snaps (network tick 1-2s) instead of teleporting
+        float t = dist < 1f ? 0.14f : dist < 4f ? 0.22f : dist < 12f ? 0.38f : dist < 30f ? 0.55f : 1f;
+        if (t >= 1f)
+        {
+            this.dotSmoothed[key] = raw;
+            return raw;
+        }
+        var lerped = System.Numerics.Vector3.Lerp(prev, raw, t);
+        this.dotSmoothed[key] = lerped;
+        return lerped;
     }
 
     private unsafe bool Hide(GameObject* obj)
@@ -447,9 +613,10 @@ public sealed class VisibilityController : IDisposable
 
     private void ResetHotkeyState()
     {
-        this.latchedNpcs = this.latchedEnemies = this.latchedMinions = this.latchedPets = this.latchedChocobos = this.latchedPlayers = false;
-        this.prevNpcs = this.prevEnemies = this.prevMinions = this.prevPets = this.prevChocobos = this.prevPlayers = false;
-        this.untilNpcs = this.untilEnemies = this.untilMinions = this.untilPets = this.untilChocobos = this.untilPlayers = 0;
+        this.latchedNpcs = this.latchedEnemies = this.latchedMinions = this.latchedPets = this.latchedChocobos = this.latchedPlayers = this.latchedDots = false;
+        this.prevNpcs = this.prevEnemies = this.prevMinions = this.prevPets = this.prevChocobos = this.prevPlayers = this.prevDots = false;
+        this.untilNpcs = this.untilEnemies = this.untilMinions = this.untilPets = this.untilChocobos = this.untilPlayers = this.untilDots = 0;
+        this.DotsVisible = false;
     }
 
     /// <summary>Hotkey behavior per the global HotkeyMode: Hold (level), Toggle (latch),
@@ -561,10 +728,115 @@ public sealed class VisibilityController : IDisposable
 
     public bool IsHiddenByPlugin(nint address) => this.hidden.ContainsKey(address);
 
+    private readonly HashSet<string> voidKeys = [];
+    private readonly HashSet<string> whiteKeys = [];
+
+    private void RefreshVoidKeys()
+    {
+        this.voidKeys.Clear();
+        foreach (var e in this.config.VoidList)
+        {
+            if (!string.IsNullOrWhiteSpace(e.Name))
+                this.voidKeys.Add(e.Name + "@" + e.World);
+        }
+    }
+
+    private void RefreshWhiteKeys()
+    {
+        this.whiteKeys.Clear();
+        foreach (var e in this.config.WhiteList)
+        {
+            if (!string.IsNullOrWhiteSpace(e.Name))
+                this.whiteKeys.Add(e.Name + "@" + e.World);
+        }
+    }
+
+    /// <summary>Live object identity key: Name@HomeWorldId.</summary>
+    public static unsafe string BuildVoidKey(GameObject* obj)
+    {
+        byte* name = (byte*)obj + 0x30;
+        int len = 0;
+        while (len < 64 && name[len] != 0)
+            len++;
+        return Encoding.ASCII.GetString(name, len) + "@" + ((Character*)obj)->HomeWorld;
+    }
+
+    public static unsafe string BuildWhiteKey(GameObject* obj) => BuildVoidKey(obj);
+
+    public bool IsVoidlisted(string key) => this.voidKeys.Contains(key);
+    public bool IsWhiteListed(string key) => this.whiteKeys.Contains(key);
+
+    /// <returns>True if added, false if blank or already listed.</returns>
+    public bool AddVoid(string name, ushort world)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+        string key = name + "@" + world;
+        if (this.voidKeys.Contains(key))
+            return false;
+        // Mutual exclusive: voiding removes from whitelist
+        if (this.whiteKeys.Contains(key))
+        {
+            for (int i = this.config.WhiteList.Count - 1; i >= 0; i--)
+                if (this.config.WhiteList[i].Name == name && this.config.WhiteList[i].World == world)
+                    this.config.WhiteList.RemoveAt(i);
+            this.RefreshWhiteKeys();
+        }
+        this.config.VoidList.Add(new PluginConfiguration.VoidEntry { Name = name, World = world });
+        this.config.Save();
+        this.RefreshVoidKeys();
+        return true;
+    }
+
+    public void RemoveVoidAt(int index)
+    {
+        if (index < 0 || index >= this.config.VoidList.Count)
+            return;
+        this.config.VoidList.RemoveAt(index);
+        this.config.Save();
+        this.RefreshVoidKeys();
+    }
+
+    public bool AddWhite(string name, ushort world)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+        string key = name + "@" + world;
+        if (this.whiteKeys.Contains(key))
+            return false;
+        // Mutual exclusive: whitelisting removes from void
+        if (this.voidKeys.Contains(key))
+        {
+            for (int i = this.config.VoidList.Count - 1; i >= 0; i--)
+                if (this.config.VoidList[i].Name == name && this.config.VoidList[i].World == world)
+                    this.config.VoidList.RemoveAt(i);
+            this.RefreshVoidKeys();
+        }
+        this.config.WhiteList.Add(new PluginConfiguration.WhiteEntry { Name = name, World = world });
+        this.config.Save();
+        this.RefreshWhiteKeys();
+        return true;
+    }
+
+    public void RemoveWhiteAt(int index)
+    {
+        if (index < 0 || index >= this.config.WhiteList.Count)
+            return;
+        this.config.WhiteList.RemoveAt(index);
+        this.config.Save();
+        this.RefreshWhiteKeys();
+    }
+
     public System.Numerics.Vector3[] GetDotPositions()
     {
         lock (this.dotLock)
             return this.dotPositions.ToArray();
+    }
+
+    public DotInfo[] GetDotInfos()
+    {
+        lock (this.dotLock)
+            return this.dotInfos.ToArray();
     }
 
     public bool IsSynced(nint address) => this.syncedAddrs.Contains(address);
