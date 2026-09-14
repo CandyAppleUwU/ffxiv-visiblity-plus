@@ -5,7 +5,9 @@ using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.Group;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
+using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using ObjectKind = Dalamud.Game.ClientState.Objects.Enums.ObjectKind;
 using BattleNpcSubKind = FFXIVClientStructs.FFXIV.Client.Game.Object.BattleNpcSubKind;
 
@@ -52,6 +54,11 @@ public sealed class VisibilityController : IDisposable
         public int FailCount;
         public long NextRetryAt;
     }
+
+    // Hidden-player positions for the dots overlay. Written on the framework
+    // thread, copied under lock by the UI thread. Rebuilt every active frame.
+    private readonly List<System.Numerics.Vector3> dotPositions = [];
+    private readonly object dotLock = new();
 
     // Immutable snapshot so Framework.Update never enumerates a list the UI thread may mutate.
     private HashSet<uint> zoneSnapshot = [];
@@ -117,6 +124,28 @@ public sealed class VisibilityController : IDisposable
 
     public bool IsFilterActiveFor(uint territoryType) => this.zoneSnapshot.Contains(territoryType);
 
+    /// <summary>Effective hide settings for a zone: its override when enabled, else globals.</summary>
+    public IHideSettings ActiveFor(uint territoryType)
+    {
+        if (this.config.ZoneOverrides.TryGetValue(territoryType, out var ov) && ov.UseCustom)
+            return ov;
+        return this.config;
+    }
+
+    public bool IsCustomActive(uint territoryType)
+        => this.config.ZoneOverrides.TryGetValue(territoryType, out var ov) && ov.UseCustom;
+
+    public ZoneOverride GetOrCreateOverride(uint territoryType)
+    {
+        if (!this.config.ZoneOverrides.TryGetValue(territoryType, out var ov))
+        {
+            ov = ZoneOverride.FromGlobals(this.config);
+            this.config.ZoneOverrides[territoryType] = ov;
+            this.config.Save();
+        }
+        return ov;
+    }
+
     public unsafe void OnUpdate(IFramework framework)
     {
         try
@@ -137,6 +166,8 @@ public sealed class VisibilityController : IDisposable
             {
                 this.ResetHotkeyState();
                 this.wasFilterActive = false;
+                lock (this.dotLock)
+                    this.dotPositions.Clear();
                 if (this.hidden.Count > 0)
                     this.ShowAll();
                 return;
@@ -149,12 +180,16 @@ public sealed class VisibilityController : IDisposable
                 this.lastSyncPoll = 0;
             }
 
+            IHideSettings s = this.ActiveFor(territory);
+
             var manager = GameObjectManager.Instance();
             if (manager == null)
                 return;
 
             uint localId = localPlayer.EntityId;
             nint localAddr = localPlayer.Address;
+            var localChr = (Character*)localPlayer.Address;
+            uint examinedId = this.ExaminedPlayerId();
 
             // Hotkeys: reveal the bound group per the global HotkeyMode.
             // Groups may share the same key, revealing everything at once.
@@ -166,6 +201,9 @@ public sealed class VisibilityController : IDisposable
             bool holdPlayers = this.HotkeyShows(ref this.latchedPlayers, ref this.prevPlayers, ref this.untilPlayers, this.config.HoldKeyPlayers, this.config.HoldCtrlPlayers, this.config.HoldShiftPlayers, this.config.HoldAltPlayers);
 
             this.PollSyncedPlayers();
+
+            lock (this.dotLock)
+                this.dotPositions.Clear();
 
             // Walk the WHOLE table, not just slots 0-199: slots 200+ hold
             // non-networked objects and slots 489+ hold lively actors, i.e.
@@ -187,21 +225,42 @@ public sealed class VisibilityController : IDisposable
                 switch (kind)
                 {
                     case ObjectKind.Pc:
+                        // Preview/portrait copies live outside the networked range and must
+                        // never hide: character/try-on/examine/plate windows render those,
+                        // not the live object. Same for our own entity ID under any slot.
+                        // (All fail-open: worst case a real player stays visible.)
+                        if (obj->ObjectIndex >= 200 || obj->EntityId == localId || obj->EntityId == examinedId)
+                        {
+                            this.Unhide(obj);
+                            break;
+                        }
                         // Local player already skipped by address above: never hide yourself.
-                        bool hidePlayer = this.config.HideNonSyncedPlayers
-                            && (this.config.HideAllPlayers || (this.SyncedDataFresh() && !this.syncedAddrs.Contains((nint)obj)));
+                        bool hidePlayer = s.HideNonSyncedPlayers
+                            && (s.HideAllPlayers || (this.SyncedDataFresh() && !this.syncedAddrs.Contains((nint)obj)));
                         if (holdPlayers)
                             hidePlayer = false; // hotkey reveals hidden players in either scope
-                        if (hidePlayer) this.Hide(obj);
+                        if (hidePlayer && this.PlayerExempt((Character*)obj, obj->EntityId, localChr, s))
+                            hidePlayer = false; // friend / party / FC keep-list
+                        if (hidePlayer)
+                        {
+                            if (this.Hide(obj))
+                            {
+                                var p = obj->Position;
+                                lock (this.dotLock)
+                                    this.dotPositions.Add(new System.Numerics.Vector3(p.X, p.Y, p.Z));
+                            }
+                        }
                         else this.Unhide(obj);
                         break;
 
                     case ObjectKind.EventNpc:
                     {
                         bool named = HasName(obj);
-                        bool hide = this.config.HideNpcs && (!this.config.OnlyUnnamedNpcs || !named);
+                        bool hide = s.HideNpcs && (!s.OnlyUnnamedNpcs || !named);
                         if (holdNpcs && named)
                             hide = false; // hold-key: named NPCs reappear while held
+                        if (hide && s.KeepQuestGivers && obj->NamePlateIconId != 0)
+                            hide = false; // quest marker showing: keep quest givers
                         if (hide) this.Hide(obj);
                         else this.Unhide(obj);
                         break;
@@ -215,14 +274,18 @@ public sealed class VisibilityController : IDisposable
                                 break; // Earthly Star: combat visual, never touch
                             if (obj->OwnerId == localId)
                                 break; // own pet
-                            if (this.config.HidePets && !holdPets) this.Hide(obj);
+                            bool hidePet = s.HidePets && !holdPets
+                                && !this.OwnerExempt(obj->OwnerId, s.KeepFriendPets, s.KeepPartyPets, s.KeepFcPets, localChr);
+                            if (hidePet) this.Hide(obj);
                             else this.Unhide(obj);
                         }
                         else if (sub == (byte)BattleNpcSubKind.Buddy)
                         {
                             if (obj->OwnerId == localId)
                                 break; // own chocobo
-                            if (this.config.HideChocobos && !holdChocobos) this.Hide(obj);
+                            bool hideBoco = s.HideChocobos && !holdChocobos
+                                && !this.OwnerExempt(obj->OwnerId, s.KeepFriendChocobos, s.KeepPartyChocobos, s.KeepFcChocobos, localChr);
+                            if (hideBoco) this.Hide(obj);
                             else this.Unhide(obj);
                         }
                         else if (sub is (byte)BattleNpcSubKind.Player or (byte)BattleNpcSubKind.NpcPartyMember)
@@ -230,16 +293,22 @@ public sealed class VisibilityController : IDisposable
                             // Friendly human NPCs: guards, quest allies, duty-support
                             // members and client-side scenario actors. Treated as NPCs.
                             bool named = HasName(obj);
-                            bool hide = this.config.HideNpcs && (!this.config.OnlyUnnamedNpcs || !named);
+                            bool hide = s.HideNpcs && (!s.OnlyUnnamedNpcs || !named);
                             if (holdNpcs && named)
                                 hide = false; // hold-key: named NPCs reappear while held
+                            if (hide && s.KeepQuestGivers && obj->NamePlateIconId != 0)
+                                hide = false; // quest marker showing: keep quest givers
                             if (hide) this.Hide(obj);
                             else this.Unhide(obj);
                         }
                         else if (sub == (byte)BattleNpcSubKind.Combatant)
                         {
                             // Enemies (note: guards share this type).
-                            if (this.config.HideEnemies && !holdEnemies) this.Hide(obj);
+                            bool hideEnemy = s.HideEnemies && !holdEnemies;
+                            if (hideEnemy && s.KeepAggroEnemies
+                                && (int)((Character*)obj)->Level >= (int)localChr->Level - 10)
+                                hideEnemy = false; // can still aggro: within 10 below or any above
+                            if (hideEnemy) this.Hide(obj);
                             else this.Unhide(obj);
                         }
                         else
@@ -253,7 +322,9 @@ public sealed class VisibilityController : IDisposable
                     case ObjectKind.Companion:
                         if (((Character*)obj)->CompanionOwnerId == localId)
                             break; // own minion
-                        if (this.config.HideMinions && !holdMinions) this.Hide(obj);
+                        bool hideMinion = s.HideMinions && !holdMinions
+                            && !this.OwnerExempt(((Character*)obj)->CompanionOwnerId, s.KeepFriendMinions, s.KeepPartyMinions, s.KeepFcMinions, localChr);
+                        if (hideMinion) this.Hide(obj);
                         else this.Unhide(obj);
                         break;
                 }
@@ -265,7 +336,7 @@ public sealed class VisibilityController : IDisposable
         }
     }
 
-    private unsafe void Hide(GameObject* obj)
+    private unsafe bool Hide(GameObject* obj)
     {
         nint addr = (nint)obj;
         var flags = VisibilityFlags.Model | VisibilityFlags.Nameplate;
@@ -279,12 +350,13 @@ public sealed class VisibilityController : IDisposable
                 obj->RenderFlags |= flags;
                 this.hidden[addr] = mine | added;
             }
-            return;
+            return true;
         }
         if ((before & flags) == flags)
-            return; // another plugin hid all of it first: yield, don't track
+            return false; // another plugin hid all of it first: yield, don't track
         obj->RenderFlags |= flags;
         this.hidden[addr] = flags & ~before;
+        return true;
     }
 
     private unsafe void Unhide(GameObject* obj)
@@ -302,6 +374,75 @@ public sealed class VisibilityController : IDisposable
     {
         // First byte of the GameObject name buffer (CS GameObject._name at 0x30).
         return *(byte*)((byte*)obj + 0x30) != 0;
+    }
+
+    private unsafe bool PlayerExempt(Character* chr, uint entityId, Character* local, IHideSettings s)
+    {
+        if (s.KeepPartyPlayers && IsInParty(entityId))
+            return true;
+        if (s.KeepFriendPlayers && chr->IsFriend)
+            return true;
+        if (s.KeepFcPlayers && SameFc(chr, local))
+            return true;
+        return false;
+    }
+
+    private unsafe bool OwnerExempt(uint ownerId, bool keepFriend, bool keepParty, bool keepFc, Character* local)
+    {
+        if (!keepFriend && !keepParty && !keepFc)
+            return false;
+        if (keepParty && IsInParty(ownerId))
+            return true;
+        if (!keepFriend && !keepFc)
+            return false;
+        var mgr = GameObjectManager.Instance();
+        if (mgr == null)
+            return false;
+        var owner = mgr->Objects.GetObjectByEntityId(ownerId);
+        if (owner == null)
+            return false;
+        var ochr = (Character*)owner;
+        if (keepFriend && ochr->IsFriend)
+            return true;
+        if (keepFc && SameFc(ochr, local))
+            return true;
+        return false;
+    }
+
+    private static unsafe bool SameFc(Character* a, Character* local)
+    {
+        if (local->FreeCompanyTag[0] == 0 || local->CurrentWorld != local->HomeWorld)
+            return false;
+        for (int i = 0; i < 7; i++)
+        {
+            if (a->FreeCompanyTag[i] != local->FreeCompanyTag[i])
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>Regular + cross-realm party membership by entity ID.</summary>
+    public static unsafe bool IsInParty(uint objectId)
+    {
+        var groupManager = GroupManager.Instance();
+        var crossRealm = InfoProxyCrossRealm.Instance();
+        if (groupManager == null || crossRealm == null)
+            return false;
+        if (groupManager->MainGroup.MemberCount > 0 && groupManager->MainGroup.IsEntityIdInParty(objectId))
+            return true;
+        if (!crossRealm->IsInCrossRealmParty)
+            return false;
+        foreach (var group in crossRealm->CrossRealmGroups)
+        {
+            if (group.GroupMembers.Length == 0)
+                continue;
+            for (int i = 0; i < group.GroupMembers.Length; i++)
+            {
+                if (group.GroupMembers[i].EntityId == objectId)
+                    return true;
+            }
+        }
+        return false;
     }
 
     private void ResetHotkeyState()
@@ -374,6 +515,24 @@ public sealed class VisibilityController : IDisposable
         }
     }
 
+    /// <summary>Entity ID of the player currently shown in the Examine window, if any.</summary>
+    private unsafe uint ExaminedPlayerId()
+    {
+        try
+        {
+            var examine = Service.GameGui.GetAddonByName("Examine");
+            if (examine.IsNull || !examine.IsVisible)
+                return 0;
+            if (Service.TargetManager.Target is Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter pc)
+                return pc.EntityId;
+            return 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
     /// <summary>Which hide-group an object belongs to, for the /vplus target inspector.</summary>
     public static string ClassifyGroup(byte objectKind, byte subKind)
     {
@@ -401,6 +560,12 @@ public sealed class VisibilityController : IDisposable
     }
 
     public bool IsHiddenByPlugin(nint address) => this.hidden.ContainsKey(address);
+
+    public System.Numerics.Vector3[] GetDotPositions()
+    {
+        lock (this.dotLock)
+            return this.dotPositions.ToArray();
+    }
 
     public bool IsSynced(nint address) => this.syncedAddrs.Contains(address);
 
@@ -438,10 +603,22 @@ public sealed class VisibilityController : IDisposable
         }
     }
 
+    private bool AnyPlayersEnabled()
+    {
+        if (this.config.HideNonSyncedPlayers)
+            return true;
+        foreach (var ov in this.config.ZoneOverrides.Values)
+        {
+            if (ov.UseCustom && ov.HideNonSyncedPlayers)
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Throttled IPC poll of handled (synced) addresses from all sources. Fail-open.</summary>
     private void PollSyncedPlayers()
     {
-        if (!this.config.HideNonSyncedPlayers)
+        if (!this.AnyPlayersEnabled())
             return;
         long now = Environment.TickCount64;
         if (now - this.lastSyncPoll < SyncPollIntervalMs)

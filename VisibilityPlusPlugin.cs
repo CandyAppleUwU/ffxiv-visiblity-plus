@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
@@ -9,12 +11,13 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
 {
     public string Name => "Visibility Plus";
 
-    public const string BuildTag = "0.1.0.17";
+    public const string BuildTag = "0.1.0.18";
 
     private const string Command = "/vplus";
 
     private readonly WindowSystem windowSystem = new("VisibilityPlus");
     private readonly ConfigWindow configWindow;
+    private readonly Dictionary<uint, ZoneWindow> zoneWindows = [];
     private readonly VisibilityController controller;
     private readonly PluginConfiguration config;
 
@@ -29,7 +32,7 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
             this.config.Save();
         }
         this.controller = new VisibilityController(this.config);
-        this.configWindow = new ConfigWindow(this.config, this.controller);
+        this.configWindow = new ConfigWindow(this.config, this.controller, this.OpenZoneSettings);
 
         this.windowSystem.AddWindow(this.configWindow);
 
@@ -110,9 +113,9 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
                     ? "Players (all hidden)"
                     : this.controller.IsSynced(target.Address) ? "Synced player (kept)" : "Non-Synced Players";
             string line1 = $"[V+] Target: {target.Name}  id={target.EntityId} (0x{target.EntityId:X})";
-            string line2 = $"[V+] Kind: {kindName} ({kind})  sub={subName} ({sub})  wrapper={target.GetType().Name}  nameId={chr->NameId}  named={VisibilityController.HasName(go)}";
+            string line2 = $"[V+] Kind: {kindName} ({kind})  sub={subName} ({sub})  wrapper={target.GetType().Name}  nameId={chr->NameId}  named={VisibilityController.HasName(go)}  lvl={chr->Level}  icon={go->NamePlateIconId}";
             string line3 = $"[V+] owner={go->OwnerId}  companionOwner={chr->CompanionOwnerId}  flags={go->RenderFlags}  alpha={chr->Alpha}";
-            string line4 = $"[V+] Group: {group}  hiddenByPlugin={this.controller.IsHiddenByPlugin(target.Address)}  zone={zone} (filtered={this.controller.IsFilterActiveFor(zone)})";
+            string line4 = $"[V+] Group: {group}  hiddenByPlugin={this.controller.IsHiddenByPlugin(target.Address)}  zone={zone} (filtered={this.controller.IsFilterActiveFor(zone)} custom={this.controller.IsCustomActive(zone)})";
             Service.ChatGui.Print(line1);
             Service.ChatGui.Print(line2);
             Service.ChatGui.Print(line3);
@@ -127,9 +130,65 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
         }
     }
 
-    private void DrawUi() => this.windowSystem.Draw();
+    private void DrawUi()
+    {
+        this.windowSystem.Draw();
+        this.DrawDots();
+    }
+
+    /// <summary>Red dots at hidden players while the dots key is held. Overlay only.</summary>
+    private void DrawDots()
+    {
+        if (!this.config.Enabled || this.config.DotsKey == 0)
+            return;
+        if (!HoldKeybind.IsDown(this.config.DotsKey))
+            return;
+        if (this.config.DotsCtrl && !HoldKeybind.IsDown(HoldKeybind.VK_CONTROL))
+            return;
+        if (this.config.DotsShift && !HoldKeybind.IsDown(HoldKeybind.VK_SHIFT))
+            return;
+        if (this.config.DotsAlt && !HoldKeybind.IsDown(HoldKeybind.VK_MENU))
+            return;
+        if (ImGui.GetIO().WantTextInput)
+            return;
+
+        var points = this.controller.GetDotPositions();
+        if (points.Length == 0)
+            return;
+        var drawList = ImGui.GetBackgroundDrawList();
+        foreach (var p in points)
+        {
+            if (!Service.GameGui.WorldToScreen(p, out var screen))
+                continue;
+            drawList.AddCircleFilled(screen, 6f, 0xFF0000FF);
+            drawList.AddCircle(screen, 6f, 0xFF000000, 16, 1.5f);
+        }
+    }
 
     private void OpenConfig() => this.configWindow.IsOpen = true;
+
+    private void OpenZoneSettings(uint territoryType)
+    {
+        if (!this.zoneWindows.TryGetValue(territoryType, out var wnd))
+        {
+            wnd = new ZoneWindow(territoryType, this.configWindow.ZoneName(territoryType), this.config, this.controller);
+            this.zoneWindows[territoryType] = wnd;
+            this.windowSystem.AddWindow(wnd);
+        }
+        // Anchor next to the main window on every open: ImGui's ini memory
+        // would otherwise pin first-opened windows top-left forever.
+        // (Window.Position is write-only, so anchor from the main window's
+        // live drawn position, not its Position property.)
+        var mainPos = this.configWindow.LastPosition;
+        var mainSize = this.configWindow.LastSize;
+        if (mainPos != default && mainSize != default)
+        {
+            float step = 28f * (this.zoneWindows.Count % 5);
+            wnd.Position = new System.Numerics.Vector2(mainPos.X + mainSize.X + 12f + step, mainPos.Y + step);
+            wnd.PositionCondition = ImGuiCond.Appearing;
+        }
+        wnd.IsOpen = true;
+    }
 
     public void Dispose()
     {

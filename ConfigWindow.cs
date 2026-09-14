@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.Components;
+using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 using Lumina.Excel.Sheets;
 
@@ -11,17 +13,19 @@ public sealed class ConfigWindow : Window
 {
     private readonly PluginConfiguration config;
     private readonly VisibilityController controller;
+    private readonly Action<uint> openZoneSettings;
+    private readonly HoldCaptureState holdState = new();
 
     private readonly List<(uint Id, string Name)> allZones = [];
     private readonly Dictionary<uint, string> zoneNames = new();
     private string zoneSearch = string.Empty;
-    private string? listeningHoldSlot;
 
-    public ConfigWindow(PluginConfiguration config, VisibilityController controller)
+    public ConfigWindow(PluginConfiguration config, VisibilityController controller, Action<uint> openZoneSettings)
         : base("Visibility Plus (/vplus)", ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.AlwaysAutoResize)
     {
         this.config = config;
         this.controller = controller;
+        this.openZoneSettings = openZoneSettings;
         this.SizeConstraints = new WindowSizeConstraints { MinimumSize = new System.Numerics.Vector2(560, 300) };
         this.LoadZones();
     }
@@ -56,54 +60,39 @@ public sealed class ConfigWindow : Window
     public string ZoneName(uint id)
         => this.zoneNames.TryGetValue(id, out var name) ? name : "Unknown zone";
 
-    private void DrawHoldKeybind(string slotId, ref int key, ref bool ctrl, ref bool shift, ref bool alt)
+    /// <summary>Live position/size from the last drawn frame (Window.Position is write-only).</summary>
+    public System.Numerics.Vector2 LastPosition { get; private set; }
+
+    public System.Numerics.Vector2 LastSize { get; private set; }
+
+    private void DrawZoneChips(uint[] selected)
     {
-        ImGui.SameLine();
-        if (this.listeningHoldSlot != slotId)
+        foreach (uint id in selected)
         {
-            string bindLabel = key == 0
-                ? "Set hold-key..."
-                : "Hold: " + HoldKeybind.ComboName(key, ctrl, shift, alt);
-            ImGui.Button(bindLabel + "##holdkey" + slotId);
-            if (ImGui.IsItemClicked(ImGuiMouseButton.Left))
-                this.listeningHoldSlot = slotId;
-            else if (key != 0 && ImGui.IsItemClicked(ImGuiMouseButton.Right))
-            {
-                key = 0;
-                ctrl = shift = alt = false;
-                this.config.Save();
-            }
+            ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(0.95f, 0.25f, 0.25f, 1f));
+            if (ImGui.Button($"X##rm{id}"))
+                this.controller.RemoveZone(id);
+            ImGui.PopStyleColor();
+            ImGui.SameLine();
+            ImGui.Text($"{id} - {this.ZoneName(id)}");
+            ImGui.SameLine();
+            bool custom = this.controller.IsCustomActive(id);
+            if (custom)
+                ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(0.35f, 0.95f, 0.35f, 1f));
+            if (ImGuiComponents.IconButton((int)(1000 + id), FontAwesomeIcon.Cog))
+                this.openZoneSettings(id);
+            if (custom)
+                ImGui.PopStyleColor();
             if (ImGui.IsItemHovered())
-            {
-                string behavior = this.config.HotkeyMode switch
-                {
-                    HotkeyMode.Toggle => "Press to show/hide this group.",
-                    HotkeyMode.Toggle30s => "Press to show this group for 30 seconds.",
-                    _ => "While held, this group reappears.",
-                };
-                ImGui.SetTooltip("Left-click, then press a key combo.\n" + behavior + "\nGroups may share the same key.\nRight-click to clear.");
-            }
-        }
-        else
-        {
-            if (ImGui.Button("Press keys... (Esc cancels)##holdkey" + slotId))
-                this.listeningHoldSlot = null;
-            else if (HoldKeybind.IsDown(HoldKeybind.VK_ESCAPE))
-                this.listeningHoldSlot = null;
-            else if (HoldKeybind.TryCapture(out int captured, out bool c, out bool s, out bool a))
-            {
-                key = captured;
-                ctrl = c;
-                shift = s;
-                alt = a;
-                this.config.Save();
-                this.listeningHoldSlot = null;
-            }
+                ImGui.SetTooltip(custom ? "Per-zone settings (custom ON)." : "Per-zone settings.");
         }
     }
 
     public override void Draw()
     {
+        this.LastPosition = ImGui.GetWindowPos();
+        this.LastSize = ImGui.GetWindowSize();
+
         bool enabled = this.config.Enabled;
         if (ImGui.Checkbox("Enabled", ref enabled))
         {
@@ -126,86 +115,12 @@ public sealed class ConfigWindow : Window
 
         ImGui.Separator();
         ImGui.Text("Hide in filtered zones:");
+        HideGroupsUI.DrawGroups(this.config, this.config, this.controller, this.holdState, string.Empty);
 
-        bool hideNpcs = this.config.HideNpcs;
-        if (ImGui.Checkbox("No-Name NPCs", ref hideNpcs))
-        {
-            this.config.HideNpcs = hideNpcs;
-            this.config.Save();
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Hide NPCs: quest givers, vendors, guards and other friendly non-player characters.\nEnemies and other battle NPCs are never touched.");
-        ImGui.SameLine();
-        ImGui.BeginDisabled(!this.config.HideNpcs);
-        bool allNpcs = this.config.HideNpcs && !this.config.OnlyUnnamedNpcs;
-        if (ImGui.Checkbox("All NPCs", ref allNpcs))
-        {
-            this.config.OnlyUnnamedNpcs = !allNpcs;
-            this.config.Save();
-        }
-        ImGui.EndDisabled();
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Also hide NPCs showing a name.\nOnly available while No-Name NPCs is on.");
-        ImGui.SameLine();
-        this.DrawHoldKeybind("npcs", ref this.config.HoldKey, ref this.config.HoldCtrl, ref this.config.HoldShift, ref this.config.HoldAlt);
-
-        bool hideEnemies = this.config.HideEnemies;
-        if (ImGui.Checkbox("Enemies", ref hideEnemies))
-        {
-            this.config.HideEnemies = hideEnemies;
-            this.config.Save();
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Enemy battle NPCs.\nNote: city guards share this type and hide too.");
-        this.DrawHoldKeybind("enemies", ref this.config.HoldKeyEnemies, ref this.config.HoldCtrlEnemies, ref this.config.HoldShiftEnemies, ref this.config.HoldAltEnemies);
-
-        bool hideMinions = this.config.HideMinions;
-        if (ImGui.Checkbox("Minions", ref hideMinions))
-        {
-            this.config.HideMinions = hideMinions;
-            this.config.Save();
-        }
-        this.DrawHoldKeybind("minions", ref this.config.HoldKeyMinions, ref this.config.HoldCtrlMinions, ref this.config.HoldShiftMinions, ref this.config.HoldAltMinions);
-
-        bool hidePets = this.config.HidePets;
-        if (ImGui.Checkbox("Pets", ref hidePets))
-        {
-            this.config.HidePets = hidePets;
-            this.config.Save();
-        }
-        this.DrawHoldKeybind("pets", ref this.config.HoldKeyPets, ref this.config.HoldCtrlPets, ref this.config.HoldShiftPets, ref this.config.HoldAltPets);
-
-        bool hideChocobos = this.config.HideChocobos;
-        if (ImGui.Checkbox("Chocobos", ref hideChocobos))
-        {
-            this.config.HideChocobos = hideChocobos;
-            this.config.Save();
-        }
-        this.DrawHoldKeybind("chocobos", ref this.config.HoldKeyChocobos, ref this.config.HoldCtrlChocobos, ref this.config.HoldShiftChocobos, ref this.config.HoldAltChocobos);
-
-        bool hidePlayers = this.config.HideNonSyncedPlayers;
-        if (ImGui.Checkbox("Non-Synced Players", ref hidePlayers))
-        {
-            this.config.HideNonSyncedPlayers = hidePlayers;
-            this.config.Save();
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Hide every player none of Snowcloak, PSync or Lightless is syncing.\nYourself is never hidden.\nNeeds one of them running.");
-        ImGui.SameLine();
-        ImGui.BeginDisabled(!this.config.HideNonSyncedPlayers);
-        bool allPlayers = this.config.HideNonSyncedPlayers && this.config.HideAllPlayers;
-        if (ImGui.Checkbox("All Players", ref allPlayers))
-        {
-            this.config.HideAllPlayers = allPlayers;
-            this.config.Save();
-        }
-        ImGui.EndDisabled();
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Also hide synced players.\nOnly available while Non-Synced Players is on.");
-        this.DrawHoldKeybind("players", ref this.config.HoldKeyPlayers, ref this.config.HoldCtrlPlayers, ref this.config.HoldShiftPlayers, ref this.config.HoldAltPlayers);
-
-        ImGui.TextDisabled(this.controller.SyncStatus);
-        ImGui.TextDisabled("Your own minion, pet and chocobo are never hidden.");
+        ImGui.Text("Dots for hidden players:");
+        HideGroupsUI.DrawHoldKeybind("dots", ref this.config.DotsKey, ref this.config.DotsCtrl, ref this.config.DotsShift, ref this.config.DotsAlt,
+            this.holdState, this.config,
+            "Left-click, then press a key combo.\nWhile held, red dots mark hidden players.\nRight-click to clear.");
 
         ImGui.Separator();
         ImGui.Text("Apply only in these zones:");
@@ -243,23 +158,27 @@ public sealed class ConfigWindow : Window
         {
             ImGui.TextDisabled("None — hiding applies nowhere until you add a zone.");
         }
+        else if (selected.Length > 10)
+        {
+            using var list = ImRaii.Child("##zonelist", new System.Numerics.Vector2(-1, ImGui.GetFrameHeightWithSpacing() * 10f), true);
+            if (list.Success)
+                this.DrawZoneChips(selected);
+        }
         else
         {
-            foreach (uint id in selected)
-            {
-                if (ImGui.Button($"X##rm{id}"))
-                    this.controller.RemoveZone(id);
-                ImGui.SameLine();
-                ImGui.Text($"{id} - {this.ZoneName(id)}");
-            }
+            this.DrawZoneChips(selected);
         }
 
         uint current = Service.ClientState.TerritoryType;
         if (ImGui.Button("Add current zone"))
             this.controller.AddZone(current);
         ImGui.SameLine();
-        if (ImGui.Button("Clear all"))
-            this.controller.ClearZones();
+        ImGui.BeginDisabled(!this.config.ZoneIds.Contains(current));
+        if (ImGui.Button("Clear Current"))
+            this.controller.RemoveZone(current);
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Remove the zone you are standing in from the filter.");
 
         ImGui.Separator();
 

@@ -4,7 +4,7 @@
   "Description": "Hide groups of NPCs, minions, pets and chocobos - applied only in selected zones. Open with /vplus.",
   "Punchline": "Zone-filtered hiding for NPCs, minions, pets and chocobos.",
   "InternalName": "VisibilityPlus",
-  "AssemblyVersion": "0.1.0.17",
+  "AssemblyVersion": "0.1.0.18",
   "RepoUrl": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus",
   "ApplicableVersion": "any",
   "Tags": [ "Hide", "Visibility", "NPC", "Minion", "Pet", "Chocobo" ],
