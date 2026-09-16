@@ -118,6 +118,9 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
     /// <summary>When true, the hold-to-void uses mouse hover target instead of hard target.</summary>
     public bool VoidOnMouseHover;
 
+    /// <summary>While bound by a duty, voidlisted players stay visible. On by default.</summary>
+    public bool VoidDontHideInDuty = true;
+
     /// <summary>Drag-select master switch: hold the bind, paint a box, release to voidlist everyone inside.</summary>
     public bool VoidUltimateEnabled;
 
@@ -152,7 +155,7 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
     public Dictionary<uint, ZoneOverride> ZoneOverrides { get; set; } = [];
 
     /// <summary>Provenance stamp so shared configs can be traced to a build.</summary>
-    public string BuildTag = "0.1.0.22";
+    public string BuildTag = "0.1.0.23";
 
     public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

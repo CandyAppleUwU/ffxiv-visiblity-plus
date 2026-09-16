@@ -321,6 +321,14 @@ public sealed class ConfigWindow : Window
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Drag select an area to voidlist multiple targets at the same time.");
         this.DrawHoldKeybindUltimate();
+        bool dutyOpt = this.config.VoidDontHideInDuty;
+        if (ImGui.Checkbox("Don't Hide in Duty", ref dutyOpt))
+        {
+            this.config.VoidDontHideInDuty = dutyOpt;
+            this.config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("While bound by a duty, voidlisted players stay visible.");
 
         // WhiteList - same concept as Void but never hidden, green hold rect, no VFX
         ImGui.Separator();

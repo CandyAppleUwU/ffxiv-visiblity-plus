@@ -149,11 +149,20 @@ public sealed class VisibilityController : IDisposable
 
     public bool IsFilterActiveFor(uint territoryType) => this.zoneSnapshot.Contains(territoryType);
 
-    /// <summary>Effective hide settings for a zone: its override when enabled, else globals.</summary>
+    /// <summary>Effective hide settings for a zone: its per-world override when enabled,
+    /// else its zone override when enabled, else globals.</summary>
     public IHideSettings ActiveFor(uint territoryType)
     {
         if (this.config.ZoneOverrides.TryGetValue(territoryType, out var ov) && ov.UseCustom)
+        {
+            if (ov.UseWorldFilter && ov.WorldOverrides.Count > 0)
+            {
+                ushort world = GetCurrentWorldId();
+                if (world != 0 && ov.WorldOverrides.TryGetValue(world, out var wov) && wov.UseCustom)
+                    return wov;
+            }
             return ov;
+        }
         return this.config;
     }
 
@@ -169,6 +178,48 @@ public sealed class VisibilityController : IDisposable
             this.config.Save();
         }
         return ov;
+    }
+
+    /// <summary>Local player's current world (visiting counts). 0 when unreadable.</summary>
+    public static unsafe ushort GetCurrentWorldId()
+    {
+        try
+        {
+            var local = Service.ObjectTable.LocalPlayer;
+            if (local == null)
+                return 0;
+            return ((Character*)local.Address)->CurrentWorld;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>Per-zone World Filter gate: true when the zone has no custom
+    /// override, the filter is off/empty, or we are on a listed world.</summary>
+    public bool IsWorldPass(uint territoryType)
+    {
+        if (!this.config.ZoneOverrides.TryGetValue(territoryType, out var ov) || !ov.UseCustom)
+            return true;
+        if (!ov.UseWorldFilter || ov.WorldOverrides.Count == 0)
+            return true;
+        ushort current = GetCurrentWorldId();
+        if (current == 0)
+            return false; // unknown world: don't hide
+        return ov.WorldOverrides.ContainsKey(current);
+    }
+
+    public WorldOverride GetOrCreateWorldOverride(uint territoryType, ushort worldId)
+    {
+        var ov = this.GetOrCreateOverride(territoryType);
+        if (!ov.WorldOverrides.TryGetValue(worldId, out var wov))
+        {
+            wov = WorldOverride.FromZone(ov);
+            ov.WorldOverrides[worldId] = wov;
+            this.config.Save();
+        }
+        return wov;
     }
 
     public unsafe void OnUpdate(IFramework framework)
@@ -236,7 +287,7 @@ public sealed class VisibilityController : IDisposable
             var localChr = (Character*)localPlayer.Address;
             uint examinedId = this.ExaminedPlayerId();
 
-            if (!this.config.Enabled || !this.zoneSnapshot.Contains(territory))
+            if (!this.config.Enabled || !this.zoneSnapshot.Contains(territory) || !this.IsWorldPass(territory))
             {
                 this.ResetHotkeyState();
                 this.wasFilterActive = false;
@@ -456,11 +507,44 @@ public sealed class VisibilityController : IDisposable
         }
     }
 
+    private static bool IsInDuty()
+    {
+        try
+        {
+            return Service.Condition[ConditionFlag.BoundByDuty];
+        }
+        catch
+        {
+            return false; // unreadable: keep voiding (existing behavior)
+        }
+    }
+
     /// <summary>Zone-independent voidlist pass: voidlisted players hide in every zone.</summary>
     private unsafe void ApplyVoidGlobal(GameObjectManager* manager, nint localAddr, uint localId, uint examinedId)
     {
         if (!this.config.VoidEnabled || this.voidKeys.Count == 0)
             return;
+        if (this.config.VoidDontHideInDuty && IsInDuty())
+        {
+            // Duty opt-out: reveal voidlisted players instead of hiding them.
+            int revealSlots = manager->Objects.IndexSorted.Length;
+            for (int i = 0; i < revealSlots; ++i)
+            {
+                GameObject* obj = manager->Objects.IndexSorted[i];
+                if (obj == null || (nint)obj == localAddr)
+                    continue;
+                if (obj->EntityId == 0 || obj->EntityId == localId || obj->EntityId == examinedId)
+                    continue;
+                if (obj->ObjectIndex >= 200)
+                    continue;
+                if ((ObjectKind)obj->ObjectKind != ObjectKind.Pc)
+                    continue;
+                if (!this.voidKeys.Contains(BuildVoidKey(obj)))
+                    continue;
+                this.Unhide(obj);
+            }
+            return;
+        }
         int slots = manager->Objects.IndexSorted.Length;
         for (int i = 0; i < slots; ++i)
         {

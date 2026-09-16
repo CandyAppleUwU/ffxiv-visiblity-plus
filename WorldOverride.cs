@@ -1,9 +1,7 @@
-using System.Collections.Generic;
-
 namespace VisibilityPlus;
 
-/// <summary>Per-zone hide/keep overrides. Inert unless <see cref="UseCustom"/> is set.</summary>
-public class ZoneOverride : IHideSettings
+/// <summary>Per-world hide/keep overrides inside a zone. Inert unless <see cref="UseCustom"/> is set.</summary>
+public class WorldOverride : IHideSettings
 {
     public bool UseCustom;
     public bool HideNpcs { get; set; }
@@ -31,13 +29,6 @@ public class ZoneOverride : IHideSettings
     public bool HideOwnMinions { get; set; }
     public bool HideOwnPets { get; set; }
     public bool HideOwnChocobos { get; set; }
-
-    /// <summary>When true, this zone's filters only apply while on a listed world.</summary>
-    public bool UseWorldFilter;
-
-    /// <summary>Worlds the filter applies on (CurrentWorld, so visiting counts).
-    /// Each entry carries optional per-world settings; custom off = zone settings apply.</summary>
-    public Dictionary<ushort, WorldOverride> WorldOverrides = [];
 
     public void CopyFrom(IHideSettings src)
     {
@@ -68,11 +59,11 @@ public class ZoneOverride : IHideSettings
         this.HideOwnChocobos = src.HideOwnChocobos;
     }
 
-    /// <summary>Snapshot of the current globals; the zone's starting defaults.</summary>
-    public static ZoneOverride FromGlobals(IHideSettings src)
+    /// <summary>Snapshot of the parent zone's settings; the world's starting defaults.</summary>
+    public static WorldOverride FromZone(IHideSettings src)
     {
-        var ov = new ZoneOverride();
-        ov.CopyFrom(src);
-        return ov;
+        var wov = new WorldOverride();
+        wov.CopyFrom(src);
+        return wov;
     }
 }

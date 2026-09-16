@@ -14,13 +14,14 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
 {
     public string Name => "Visibility Plus";
 
-    public const string BuildTag = "0.1.0.22";
+    public const string BuildTag = "0.1.0.23";
 
     private const string Command = "/vplus";
 
     private readonly WindowSystem windowSystem = new("VisibilityPlus");
     private readonly ConfigWindow configWindow;
     private readonly Dictionary<uint, ZoneWindow> zoneWindows = [];
+    private readonly Dictionary<(uint Zone, ushort World), WorldWindow> worldWindows = [];
     private readonly VisibilityController controller;
     private readonly PluginConfiguration config;
 
@@ -1131,7 +1132,7 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
     {
         if (!this.zoneWindows.TryGetValue(territoryType, out var wnd))
         {
-            wnd = new ZoneWindow(territoryType, this.configWindow.ZoneName(territoryType), this.config, this.controller);
+            wnd = new ZoneWindow(territoryType, this.configWindow.ZoneName(territoryType), this.config, this.controller, this.OpenWorldSettings);
             this.zoneWindows[territoryType] = wnd;
             this.windowSystem.AddWindow(wnd);
         }
@@ -1144,6 +1145,28 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
         if (mainPos != default && mainSize != default)
         {
             float step = 28f * (this.zoneWindows.Count % 5);
+            wnd.Position = new System.Numerics.Vector2(mainPos.X + mainSize.X + 12f + step, mainPos.Y + step);
+            wnd.PositionCondition = ImGuiCond.Appearing;
+        }
+        wnd.IsOpen = true;
+    }
+
+    private void OpenWorldSettings(uint territoryType, ushort worldId)
+    {
+        var key = (territoryType, worldId);
+        if (!this.worldWindows.TryGetValue(key, out var wnd))
+        {
+            var zoneOv = this.controller.GetOrCreateOverride(territoryType);
+            var worldOv = this.controller.GetOrCreateWorldOverride(territoryType, worldId);
+            wnd = new WorldWindow(territoryType, worldId, WorldName(worldId), this.config, zoneOv, worldOv);
+            this.worldWindows[key] = wnd;
+            this.windowSystem.AddWindow(wnd);
+        }
+        var mainPos = this.configWindow.LastPosition;
+        var mainSize = this.configWindow.LastSize;
+        if (mainPos != default && mainSize != default)
+        {
+            float step = 28f * (this.worldWindows.Count % 5);
             wnd.Position = new System.Numerics.Vector2(mainPos.X + mainSize.X + 12f + step, mainPos.Y + step);
             wnd.PositionCondition = ImGuiCond.Appearing;
         }
