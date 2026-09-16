@@ -92,6 +92,13 @@ public sealed class ConfigWindow : Window
             this.holdState, this.config, hint);
     }
 
+    private void DrawHoldKeybindUltimate()
+    {
+        const string hint = "Hold this combo to arm left-mouse drag-select.\nWhile held, left-drag a box: everyone inside is voidlisted on release.\nRight-click while dragging to cancel.\nRight-click the button to clear.";
+        HideGroupsUI.DrawHoldKeybind("voidultimate", ref this.config.VoidUltimateKey, ref this.config.VoidUltimateCtrl, ref this.config.VoidUltimateShift, ref this.config.VoidUltimateAlt,
+            this.holdState, this.config, hint);
+    }
+
     private void DrawHoldKeybindWhite()
     {
         string hint = this.config.WhiteOnMouseHover
@@ -305,6 +312,15 @@ public sealed class ConfigWindow : Window
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("When enabled, the hold keybind voids the player under your mouse cursor\ninstead of your hard target. Hover the nameplate/model, hold the bind.");
+        bool ultOn = this.config.VoidUltimateEnabled;
+        if (ImGui.Checkbox("Void Ultimate", ref ultOn))
+        {
+            this.config.VoidUltimateEnabled = ultOn;
+            this.config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Drag select an area to voidlist multiple targets at the same time.");
+        this.DrawHoldKeybindUltimate();
 
         // WhiteList - same concept as Void but never hidden, green hold rect, no VFX
         ImGui.Separator();

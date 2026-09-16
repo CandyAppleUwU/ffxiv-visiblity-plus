@@ -47,6 +47,11 @@ public sealed class VisibilityController : IDisposable
     private HashSet<nint> syncedAddrs = [];
     private long lastSyncPoll;
     private bool wasFilterActive;
+    // Load-boundary tracking: address keys don't survive despawn/recycle, so
+    // restore while the old table is still intact on entry to loading, then
+    // sweep again on the next stable frame as backup.
+    private bool wasStable;
+    private bool sawLoading;
     private const long SyncPollIntervalMs = 1_000;
     private const long SyncStaleAfterMs = 10_000;
     private const long SyncBackoffMs = 15_000;
@@ -192,18 +197,39 @@ public sealed class VisibilityController : IDisposable
             var client = Service.ClientState;
             var localPlayer = Service.ObjectTable.LocalPlayer;
             if (!client.IsLoggedIn || localPlayer == null)
+            {
+                this.OnEnterLoading();
                 return;
+            }
 
             uint territory = client.TerritoryType;
             if (territory == 0)
-                return; // mid-load flap, leave state alone
+            {
+                this.OnEnterLoading();
+                return; // mid-load flap, restore first, then leave state alone
+            }
 
             if (Service.Condition[ConditionFlag.BetweenAreas])
+            {
+                this.OnEnterLoading();
                 return;
+            }
 
             var manager = GameObjectManager.Instance();
             if (manager == null)
                 return;
+
+            // Backup sweep: first stable frame after any loading episode (same
+            // zone hop included — BetweenAreas fires there too). Restores high
+            // slots before the filter branches run, so recycled addresses never
+            // inherit stale hide-bits into a zone where they should be visible.
+            if (this.sawLoading)
+            {
+                this.sawLoading = false;
+                if (this.hidden.Count > 0)
+                    this.ShowAll();
+            }
+            this.wasStable = true;
 
             uint localId = localPlayer.EntityId;
             nint localAddr = localPlayer.Address;
@@ -611,6 +637,24 @@ public sealed class VisibilityController : IDisposable
         return false;
     }
 
+    /// <summary>First loading frame after stable play: old native table is still
+    /// largely intact, so restore now before despawn/recycle strands hide-bits
+    /// in pooled memory. Fires for cross-zone AND same-zone hops.</summary>
+    private void OnEnterLoading()
+    {
+        // Only the stable -> loading transition restores; every frame after
+        // that hidden is already empty so there is nothing to do.
+        if (!this.wasStable)
+        {
+            this.sawLoading = true;
+            return;
+        }
+        this.wasStable = false;
+        this.sawLoading = true;
+        if (this.hidden.Count > 0)
+            this.ShowAll();
+    }
+
     private void ResetHotkeyState()
     {
         this.latchedNpcs = this.latchedEnemies = this.latchedMinions = this.latchedPets = this.latchedChocobos = this.latchedPlayers = this.latchedDots = false;
@@ -926,27 +970,51 @@ public sealed class VisibilityController : IDisposable
     }
 
     /// <summary>Restore every object this plugin hid. Safe to call from Dispose.</summary>
-    public void ShowAll()
+    public unsafe void ShowAll()
     {
         try
         {
             if (this.hidden.Count == 0)
                 return;
 
+            // Walk the FULL native table, not the managed ObjectTable: the hide
+            // loop covers high slots (200+ non-networked, 489+ lively actors)
+            // that Service.ObjectTable never yields. A managed-only sweep left
+            // those RenderFlags bits set; pooled native memory then handed the
+            // invisibility to the next zone's occupants at recycled addresses.
+            var manager = GameObjectManager.Instance();
+            if (manager != null)
+            {
+                int slots = manager->Objects.IndexSorted.Length;
+                for (int i = 0; i < slots; ++i)
+                {
+                    GameObject* obj = manager->Objects.IndexSorted[i];
+                    if (obj == null)
+                        continue;
+                    nint addr = (nint)obj;
+                    if (!this.hidden.TryGetValue(addr, out var mine))
+                        continue;
+                    if (mine != VisibilityFlags.None)
+                        obj->RenderFlags &= ~mine;
+                    this.hidden.Remove(addr);
+                }
+                if (this.hidden.Count == 0)
+                    return;
+            }
+
+            // Fallback for anything the native walk missed (already despawned
+            // wrappers still cached by Dalamud, Dispose off-thread, etc.).
             foreach (var obj in Service.ObjectTable)
             {
                 if (obj == null)
                     continue;
                 if (!this.hidden.TryGetValue(obj.Address, out var mine))
                     continue;
-                unsafe
-                {
-                    var go = (GameObject*)obj.Address;
-                    if (go == null)
-                        continue;
-                    if (mine != VisibilityFlags.None)
-                        go->RenderFlags &= ~mine;
-                }
+                var go = (GameObject*)obj.Address;
+                if (go == null)
+                    continue;
+                if (mine != VisibilityFlags.None)
+                    go->RenderFlags &= ~mine;
                 this.hidden.Remove(obj.Address);
             }
 

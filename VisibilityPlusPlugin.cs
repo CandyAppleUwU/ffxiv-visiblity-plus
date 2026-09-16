@@ -146,6 +146,7 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
         this.DrawDots();
         this.DrawVoidAdd();
         this.DrawWhiteAdd();
+        this.DrawVoidUltimate();
     }
 
     private long voidHoldStart;
@@ -184,6 +185,32 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
     private string? pendingWhiteName;
     private ushort pendingWhiteWorld;
     private System.Numerics.Vector2 pendingWhitePos;
+
+    // Void Ultimate drag-select: hold bind, paint a rubber-band box, release to
+    // voidlist everyone inside. Right-click while dragging cancels.
+    private const string UltimateVfxPath = "vfx/monster/c0901/eff/c0901sp_07t0m.avfx";
+    private const uint VK_RBUTTON = 0x02;
+
+    private sealed class UltTarget
+    {
+        public string Name = string.Empty;
+        public ushort World;
+        public nint Address;
+        public uint EntityId;
+        public System.Numerics.Vector2 Screen;
+    }
+
+    private sealed class PendingUltimate
+    {
+        public List<(string Name, ushort World)> Targets = [];
+        public long DueTick;
+    }
+
+    private readonly List<PendingUltimate> pendingUltimates = [];
+    private readonly List<UltTarget> ultSelected = [];
+    private bool ultDragging;
+    private bool ultCancelled;
+    private System.Numerics.Vector2 ultAnchor;
 
     /// <summary>Hold the void bind 3s on a targeted player to voidlist them, with progress square.</summary>
     private void DrawVoidAdd()
@@ -326,6 +353,240 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
             this.AddWhiteFromPlayer(target.Name.TextValue, (ushort)target.HomeWorld.RowId);
             this.whiteNeedRelease = true;
             this.whiteHoldStart = 0;
+        }
+    }
+
+    /// <summary>Void Ultimate drag-select: hold the bind to arm left-mouse, then
+    /// left-drag a rubber-band box. Red boxes mark players inside. Releasing the
+    /// left button VFX + voidlists them after 200ms. Right-click cancels.</summary>
+    private void DrawVoidUltimate()
+    {
+        // The bind only arms; the left mouse button does the selecting.
+        bool armed = this.config.VoidUltimateEnabled && this.config.VoidUltimateKey != 0
+            && HoldKeybind.IsDown(this.config.VoidUltimateKey)
+            && (!this.config.VoidUltimateCtrl || HoldKeybind.IsDown(HoldKeybind.VK_CONTROL))
+            && (!this.config.VoidUltimateShift || HoldKeybind.IsDown(HoldKeybind.VK_SHIFT))
+            && (!this.config.VoidUltimateAlt || HoldKeybind.IsDown(HoldKeybind.VK_MENU));
+        bool typing = ImGui.GetIO().WantTextInput;
+        if (!armed || typing)
+        {
+            // Arming lost mid-drag (or typing started): discard, never confirm.
+            if (this.ultDragging)
+            {
+                this.ultDragging = false;
+                this.ultCancelled = false;
+                this.ultSelected.Clear();
+            }
+            return;
+        }
+
+        // Fullscreen invisible overlay while armed: the active drag button makes
+        // ImGui capture the mouse, so the left-drag paints the rubber band
+        // instead of rotating the game camera / retargeting.
+        var io = ImGui.GetIO();
+        ImGui.SetNextWindowPos(System.Numerics.Vector2.Zero);
+        ImGui.SetNextWindowSize(io.DisplaySize);
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new System.Numerics.Vector4(0f, 0f, 0f, 0f));
+        ImGui.PushStyleColor(ImGuiCol.Border, new System.Numerics.Vector4(0f, 0f, 0f, 0f));
+        const ImGuiWindowFlags overlayFlags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove
+            | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.NoCollapse
+            | ImGuiWindowFlags.NoBackground | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoBringToFrontOnFocus
+            | ImGuiWindowFlags.NoNavFocus | ImGuiWindowFlags.NoNavInputs;
+        ImGui.Begin("##voidUltOverlay", overlayFlags);
+        ImGui.InvisibleButton("##voidUltDrag", io.DisplaySize);
+
+        var mouse = ImGui.GetMousePos();
+        bool leftDown = ImGui.IsMouseDown(ImGuiMouseButton.Left);
+        if (!this.ultDragging && !leftDown)
+        {
+            ImGui.GetBackgroundDrawList().AddText(ImGui.GetFont(), ImGui.GetFontSize(), mouse + new System.Numerics.Vector2(14, 14), 0xFF0000FF, "Void Ultimate: drag to select");
+        }
+        else
+        {
+            if (!this.ultDragging)
+            {
+                this.ultDragging = true;
+                this.ultCancelled = false;
+                this.ultAnchor = mouse;
+                this.ultSelected.Clear();
+            }
+            if (ImGui.IsMouseClicked(ImGuiMouseButton.Right) || HoldKeybind.IsDown((int)VK_RBUTTON))
+                this.ultCancelled = true; // stays cancelled until the drag ends
+            if (this.ultCancelled)
+            {
+                ImGui.GetBackgroundDrawList().AddRect(this.ultAnchor, mouse, 0xAA888888, 0f, ImDrawFlags.None, 1.5f);
+                if (!leftDown)
+                {
+                    // Left released after cancel: discard.
+                    this.ultDragging = false;
+                    this.ultCancelled = false;
+                    this.ultSelected.Clear();
+                }
+            }
+            else if (!leftDown)
+            {
+                // Left released: confirm the drag.
+                var done = new List<UltTarget>(this.ultSelected);
+                this.ultDragging = false;
+                this.ultCancelled = false;
+                this.ultSelected.Clear();
+                if (done.Count > 0)
+                    this.ConfirmVoidUltimate(done);
+            }
+            else
+            {
+                float x0 = System.Math.Min(this.ultAnchor.X, mouse.X);
+                float x1 = System.Math.Max(this.ultAnchor.X, mouse.X);
+                float y0 = System.Math.Min(this.ultAnchor.Y, mouse.Y);
+                float y1 = System.Math.Max(this.ultAnchor.Y, mouse.Y);
+
+                var local = Service.ObjectTable.LocalPlayer;
+                this.ultSelected.Clear();
+                if (x1 - x0 < 8f && y1 - y0 < 8f)
+                {
+                    // Click without a drag: pick the closest player to the cursor.
+                    UltTarget? best = null;
+                    float bestDist = 28f;
+                    foreach (var obj in Service.ObjectTable)
+                    {
+                        if (obj is not IPlayerCharacter pc || local == null || pc.Address == local.Address)
+                            continue;
+                        if (!Service.GameGui.WorldToScreen(pc.Position, out var screen))
+                            continue;
+                        float dist = (mouse - screen).Length();
+                        if (dist < bestDist)
+                        {
+                            bestDist = dist;
+                            best = new UltTarget { Name = pc.Name.TextValue, World = (ushort)pc.HomeWorld.RowId, Address = pc.Address, EntityId = pc.EntityId, Screen = screen };
+                        }
+                    }
+                    if (best != null)
+                        this.ultSelected.Add(best);
+                }
+                else
+                {
+                    foreach (var obj in Service.ObjectTable)
+                    {
+                        if (obj is not IPlayerCharacter pc || local == null || pc.Address == local.Address)
+                            continue;
+                        if (!Service.GameGui.WorldToScreen(pc.Position, out var screen))
+                            continue;
+                        if (screen.X >= x0 && screen.X <= x1 && screen.Y >= y0 && screen.Y <= y1)
+                            this.ultSelected.Add(new UltTarget { Name = pc.Name.TextValue, World = (ushort)pc.HomeWorld.RowId, Address = pc.Address, EntityId = pc.EntityId, Screen = screen });
+                    }
+                }
+
+                var dl = ImGui.GetBackgroundDrawList();
+                dl.AddRect(this.ultAnchor, mouse, 0xFFFFFFFF, 0f, ImDrawFlags.None, 1.5f);
+                dl.AddRectFilled(
+                    new System.Numerics.Vector2(x0, y0),
+                    new System.Numerics.Vector2(x1, y1),
+                    0x330000FF);
+                foreach (var t in this.ultSelected)
+                    DrawUltimateBox(t.Address);
+                if (this.ultSelected.Count > 0)
+                    dl.AddText(ImGui.GetFont(), ImGui.GetFontSize(), mouse + new System.Numerics.Vector2(14, 14), 0xFF0000FF, $"{this.ultSelected.Count} selected");
+            }
+        }
+
+        ImGui.End();
+        ImGui.PopStyleColor(2);
+    }
+
+    /// <summary>Red outline box around a player actor, same style as the hold-to-void square.</summary>
+    private static void DrawUltimateBox(nint address)
+    {
+        try
+        {
+            unsafe
+            {
+                var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)address;
+                if (go == null)
+                    return;
+                var feet = go->Position;
+                var head = new System.Numerics.Vector3(feet.X, feet.Y + 2f, feet.Z);
+                if (!Service.GameGui.WorldToScreen(feet, out var feetScreen)
+                    || !Service.GameGui.WorldToScreen(head, out var headScreen))
+                    return;
+                float heightPx = System.Math.Abs(feetScreen.Y - headScreen.Y);
+                if (heightPx < 4f || heightPx > 10000f)
+                    return;
+                float widthPx = heightPx * 0.6f;
+                if (widthPx < 2f || widthPx > 10000f)
+                    return;
+                float left = feetScreen.X - widthPx * 0.5f;
+                float top = feetScreen.Y - heightPx;
+                ImGui.GetBackgroundDrawList().AddRect(
+                    new System.Numerics.Vector2(left, top),
+                    new System.Numerics.Vector2(left + widthPx, feetScreen.Y),
+                    0xFF0000FF, 0f, ImDrawFlags.None, 2f);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private void ConfirmVoidUltimate(List<UltTarget> targets)
+    {
+        try
+        {
+            // De-dupe and drop anyone already voidlisted or already pending.
+            var fresh = new List<UltTarget>();
+            var seen = new HashSet<string>();
+            lock (this.pendingLock)
+            {
+                foreach (var t in targets)
+                {
+                    if (string.IsNullOrWhiteSpace(t.Name) || !seen.Add(t.Name + "@" + t.World))
+                        continue;
+                    string key = t.Name + "@" + t.World;
+                    if (this.controller.IsVoidlisted(key))
+                        continue;
+                    bool pending = false;
+                    foreach (var p in this.pendingVoids)
+                        if (p.Name == t.Name && p.World == t.World) { pending = true; break; }
+                    if (!pending)
+                        foreach (var u in this.pendingUltimates)
+                            foreach (var ut in u.Targets)
+                                if (ut.Name == t.Name && ut.World == t.World) { pending = true; break; }
+                    if (!pending)
+                        fresh.Add(t);
+                }
+            }
+            if (fresh.Count == 0)
+            {
+                Service.ChatGui.Print("[Visibility Plus] Void Ultimate: everyone selected is already voidlisted.");
+                return;
+            }
+
+            // Most-center target carries the VFX.
+            var centroid = System.Numerics.Vector2.Zero;
+            foreach (var t in fresh)
+                centroid += t.Screen;
+            centroid /= fresh.Count;
+            UltTarget center = fresh[0];
+            float best = float.MaxValue;
+            foreach (var t in fresh)
+            {
+                float d = (t.Screen - centroid).LengthSquared();
+                if (d < best) { best = d; center = t; }
+            }
+            if (VfxHelper.TrySpawnOnActor(UltimateVfxPath, center.Address, center.Address, out var vfxPtr))
+                Service.PluginLog.Info($"[Visibility Plus] Ultimate VFX on {center.Name} ptr=0x{vfxPtr:X}");
+            else
+                Service.PluginLog.Warning($"[Visibility Plus] Ultimate VFX failed for {center.Name} — voidlisting anyway after delay.");
+
+            var names = new List<(string Name, ushort World)>(fresh.Count);
+            foreach (var t in fresh)
+                names.Add((t.Name, t.World));
+            lock (this.pendingLock)
+                this.pendingUltimates.Add(new PendingUltimate { Targets = names, DueTick = Environment.TickCount64 + 200 });
+            Service.ChatGui.Print($"[Visibility Plus] Void Ultimate on {fresh.Count} player{(fresh.Count == 1 ? string.Empty : "s")}...");
+        }
+        catch (Exception ex)
+        {
+            Service.PluginLog.Warning($"[Visibility Plus] Void Ultimate failed: {ex.Message}");
         }
     }
 
@@ -474,9 +735,35 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
     {
         try
         {
-            if (this.pendingVoids.Count == 0)
+            if (this.pendingVoids.Count == 0 && this.pendingUltimates.Count == 0)
                 return;
             long now = Environment.TickCount64;
+            // Void Ultimate: VFX already played on confirm, voidlist 200ms later.
+            List<PendingUltimate> dueUltimates = new();
+            lock (this.pendingLock)
+            {
+                foreach (var u in this.pendingUltimates)
+                    if (now >= u.DueTick)
+                        dueUltimates.Add(u);
+                foreach (var u in dueUltimates)
+                    this.pendingUltimates.Remove(u);
+            }
+            foreach (var u in dueUltimates)
+            {
+                int added = 0;
+                foreach (var t in u.Targets)
+                    if (this.controller.AddVoid(t.Name, t.World))
+                        added++;
+                if (added > 0)
+                {
+                    string msg = $"[Visibility Plus] Voidlisted {added} player{(added == 1 ? string.Empty : "s")} via Void Ultimate.";
+                    if (!this.config.VoidEnabled)
+                        msg += " (enable VoidList to hide them.)";
+                    Service.ChatGui.Print(msg);
+                }
+                else
+                    Service.ChatGui.Print("[Visibility Plus] Void Ultimate: everyone selected is already voidlisted.");
+            }
             List<PendingVoid> toRemove = new();
             lock (this.pendingLock)
             {
@@ -842,7 +1129,10 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
                 if (p.ChainVfxPtr != nint.Zero)
                     VfxHelper.TryRemove(p.ChainVfxPtr);
             this.pendingVoids.Clear();
+            this.pendingUltimates.Clear();
         }
+        this.ultDragging = false;
+        this.ultSelected.Clear();
         this.windowSystem.RemoveAllWindows();
         this.controller.Dispose();
         GC.SuppressFinalize(this);

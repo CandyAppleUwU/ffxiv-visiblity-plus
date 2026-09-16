@@ -118,6 +118,15 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
     /// <summary>When true, the hold-to-void uses mouse hover target instead of hard target.</summary>
     public bool VoidOnMouseHover;
 
+    /// <summary>Drag-select master switch: hold the bind, paint a box, release to voidlist everyone inside.</summary>
+    public bool VoidUltimateEnabled;
+
+    /// <summary>Hold this combo and move the mouse to paint the selection box. Release to confirm, right-click to cancel.</summary>
+    public int VoidUltimateKey;
+    public bool VoidUltimateCtrl;
+    public bool VoidUltimateShift;
+    public bool VoidUltimateAlt;
+
     // WhiteList: same shape as VoidList but never hidden, no VFX, green hold rect.
     public class WhiteEntry
     {
