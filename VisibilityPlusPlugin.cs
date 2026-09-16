@@ -14,7 +14,7 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
 {
     public string Name => "Visibility Plus";
 
-    public const string BuildTag = "0.1.0.19";
+    public const string BuildTag = "0.1.0.20";
 
     private const string Command = "/vplus";
 

@@ -152,7 +152,7 @@ public class PluginConfiguration : IPluginConfiguration, IHideSettings
     public Dictionary<uint, ZoneOverride> ZoneOverrides { get; set; } = [];
 
     /// <summary>Provenance stamp so shared configs can be traced to a build.</summary>
-    public string BuildTag = "0.1.0.19";
+    public string BuildTag = "0.1.0.20";
 
     public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

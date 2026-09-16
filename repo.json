@@ -5,7 +5,7 @@
     "Description": "Hide groups of NPCs, minions, pets and chocobos - applied only in selected zones. Open with /vplus.",
     "Punchline": "Zone-filtered hiding for NPCs, minions, pets and chocobos.",
     "InternalName": "VisibilityPlus",
-    "AssemblyVersion": "0.1.0.19",
+    "AssemblyVersion": "0.1.0.20",
     "RepoUrl": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus",
     "ApplicableVersion": "any",
     "Tags": [
@@ -19,9 +19,9 @@
     "DalamudApiLevel": 15,
     "IsHide": "False",
     "IsTestingExclusive": "False",
-    "LastUpdated": 1789408520,
-    "DownloadLinkInstall": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus/releases/download/v0.1.0.19/VisibilityPlus.zip",
-    "DownloadLinkTesting": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus/releases/download/v0.1.0.19/VisibilityPlus.zip",
-    "DownloadLinkUpdate": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus/releases/download/v0.1.0.19/VisibilityPlus.zip"
+    "LastUpdated": 1789531052,
+    "DownloadLinkInstall": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus/releases/download/v0.1.0.20/VisibilityPlus.zip",
+    "DownloadLinkTesting": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus/releases/download/v0.1.0.20/VisibilityPlus.zip",
+    "DownloadLinkUpdate": "https://github.com/CandyAppleUwU/ffxiv-visiblity-plus/releases/download/v0.1.0.20/VisibilityPlus.zip"
   }
 ]
