@@ -14,7 +14,7 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
 {
     public string Name => "Visibility Plus";
 
-    public const string BuildTag = "0.1.0.20";
+    public const string BuildTag = "0.1.0.21";
 
     private const string Command = "/vplus";
 
@@ -242,6 +242,11 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
             this.voidHoldStart = 0;
             return;
         }
+        if (this.controller.IsHiddenByPlugin(target.Address))
+        {
+            this.voidHoldStart = 0; // already hidden: nothing to void
+            return;
+        }
         if (target.EntityId != this.voidHoldTarget)
         {
             this.voidHoldTarget = target.EntityId;
@@ -451,6 +456,8 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
                     {
                         if (obj is not IPlayerCharacter pc || local == null || pc.Address == local.Address)
                             continue;
+                        if (this.controller.IsHiddenByPlugin(pc.Address))
+                            continue; // already hidden: nothing to void
                         if (!Service.GameGui.WorldToScreen(pc.Position, out var screen))
                             continue;
                         float dist = (mouse - screen).Length();
@@ -469,6 +476,8 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
                     {
                         if (obj is not IPlayerCharacter pc || local == null || pc.Address == local.Address)
                             continue;
+                        if (this.controller.IsHiddenByPlugin(pc.Address))
+                            continue; // already hidden: nothing to void
                         if (!Service.GameGui.WorldToScreen(pc.Position, out var screen))
                             continue;
                         if (screen.X >= x0 && screen.X <= x1 && screen.Y >= y0 && screen.Y <= y1)
@@ -540,6 +549,8 @@ public sealed class VisibilityPlusPlugin : IDalamudPlugin
                 {
                     if (string.IsNullOrWhiteSpace(t.Name) || !seen.Add(t.Name + "@" + t.World))
                         continue;
+                    if (this.controller.IsHiddenByPlugin(t.Address))
+                        continue; // hidden since selection: nothing to void
                     string key = t.Name + "@" + t.World;
                     if (this.controller.IsVoidlisted(key))
                         continue;
